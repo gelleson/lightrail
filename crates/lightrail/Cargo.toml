@@ -1,0 +1,42 @@
+[package]
+name = "lightrail"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Agentless branch environment orchestration"
+
+[[bin]]
+name = "lightrail"
+path = "src/main.rs"
+
+[dependencies]
+anyhow.workspace = true
+async-trait.workspace = true
+clap.workspace = true
+clap_complete.workspace = true
+dialoguer.workspace = true
+directories.workspace = true
+futures.workspace = true
+hex.workspace = true
+keyring.workspace = true
+lightrail-core = { path = "../lightrail-core" }
+lightrail-plugin-protocol = { path = "../lightrail-plugin-protocol" }
+reqwest.workspace = true
+secrecy.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+tempfile.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+toml.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+uuid.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+
+[lints]
+workspace = true

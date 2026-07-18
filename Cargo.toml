@@ -1,0 +1,51 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/lightrail",
+    "crates/lightrail-core",
+    "crates/lightrail-plugin-protocol",
+    "plugins/lightrail-plugin-compose",
+    "plugins/lightrail-plugin-hetzner",
+    "plugins/lightrail-plugin-ssh",
+]
+default-members = [
+    "crates/lightrail",
+    "crates/lightrail-core",
+    "crates/lightrail-plugin-protocol",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+license = "MIT OR Apache-2.0"
+
+[workspace.dependencies]
+anyhow = "1.0"
+async-trait = "0.1"
+clap = { version = "4.5", features = ["derive", "env"] }
+clap_complete = "4.5"
+dialoguer = "0.11"
+directories = "6.0"
+futures = "0.3"
+hex = "0.4"
+keyring = "3.6"
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+secrecy = { version = "0.10", features = ["serde"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+sha2 = "0.10"
+tempfile = "3.15"
+thiserror = "2.0"
+tokio = { version = "1.43", features = ["fs", "io-util", "macros", "process", "rt-multi-thread", "signal", "sync", "time"] }
+toml = "0.8"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+uuid = { version = "1.12", features = ["serde", "v4"] }
+
+[workspace.lints.rust]
+unsafe_code = "warn"
+
+[workspace.lints.clippy]
+all = "warn"
+pedantic = "warn"

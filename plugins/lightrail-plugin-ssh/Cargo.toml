@@ -1,0 +1,22 @@
+[package]
+name = "lightrail-plugin-ssh"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Bundled generic SSH target capability for Lightrail"
+
+[dependencies]
+anyhow.workspace = true
+async-trait.workspace = true
+hex.workspace = true
+lightrail-plugin-protocol = { path = "../../crates/lightrail-plugin-protocol" }
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+uuid.workspace = true
+
+[lints]
+workspace = true

@@ -1,0 +1,1282 @@
+//! `lightrail init` discovery and configuration generation.
+
+use std::{
+    collections::BTreeMap,
+    fmt,
+    path::{Path, PathBuf},
+};
+
+use dialoguer::{Input, MultiSelect, Select, theme::ColorfulTheme};
+use lightrail_core::{
+    App, CONFIG_SCHEMA_VERSION, DnsLabel, Isolation, LightrailConfig, PluginId, PluginPipeline,
+    Profile, Project, ProjectId,
+};
+use serde::{Deserialize, Serialize};
+
+use crate::{
+    compose::{ComposeInspector, ComposeInventory, ServiceInventory},
+    error::CliError,
+    plugin_host::{COMPOSE_PLUGIN_ID, HETZNER_PLUGIN_ID, SSH_PLUGIN_ID},
+    plugin_registry::PluginLock,
+    process::TokioCommandRunner,
+    workspace::{CONFIG_FILE, ProjectPaths},
+};
+
+/// Inputs supplied by the command-line dispatcher.
+#[derive(Clone, Debug)]
+pub struct InitOptions {
+    /// Directory from which repository discovery starts.
+    pub start: PathBuf,
+    /// First committed profile name.
+    pub profile: String,
+    /// Do not open a terminal prompt.
+    pub non_interactive: bool,
+    /// Optional TOML or JSON answers file.
+    pub answers_file: Option<PathBuf>,
+    /// Explicitly permit replacement of an existing `lightrail.toml`.
+    pub force: bool,
+}
+
+/// Declarative answers accepted by `init --from`.
+///
+/// TOML uses `[[apps]]` for application entries and `[settings.<capability>]`
+/// for opaque plugin settings.
+#[derive(Clone, Debug, Default, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct InitAnswers {
+    /// Project slug. Defaults to the Compose project name or repository name.
+    pub project_slug: Option<String>,
+    /// Compose files in merge order, relative to the repository root.
+    #[serde(default)]
+    pub compose: Vec<PathBuf>,
+    /// Target provider. Defaults to generic SSH.
+    pub target: Option<TargetKind>,
+    /// Isolation override. Defaults to project for SSH and machine for Hetzner.
+    pub isolation: Option<Isolation>,
+    /// Explicit public application routes.
+    #[serde(default)]
+    pub apps: Vec<AppAnswer>,
+    /// IP-derived DNS suffix. Only `sslip.io` and `nip.io` are accepted.
+    pub dns_domain: Option<String>,
+    /// Opaque settings merged over generated capability defaults.
+    #[serde(default)]
+    pub settings: BTreeMap<String, toml::Value>,
+}
+
+/// One public application answer.
+#[derive(Clone, Debug, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct AppAnswer {
+    /// Public app name; defaults to `service`.
+    #[serde(default)]
+    pub name: Option<String>,
+    /// Compose service backing this route.
+    pub service: String,
+    /// Internal container port. Required when the service exposes several.
+    #[serde(default)]
+    pub port: Option<u16>,
+    /// Optional HTTP readiness path.
+    #[serde(default)]
+    pub health_path: Option<String>,
+    /// Optional exact readiness status.
+    #[serde(default)]
+    pub health_status: Option<u16>,
+}
+
+/// Supported initial target choices.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TargetKind {
+    /// An existing generic Linux host reached with OpenSSH.
+    Ssh,
+    /// A dedicated Hetzner Cloud server.
+    Hetzner,
+}
+
+impl TargetKind {
+    const fn target_plugin(self) -> &'static str {
+        match self {
+            Self::Ssh => SSH_PLUGIN_ID,
+            Self::Hetzner => HETZNER_PLUGIN_ID,
+        }
+    }
+
+    const fn default_isolation(self) -> Isolation {
+        match self {
+            Self::Ssh => Isolation::Project,
+            Self::Hetzner => Isolation::Machine,
+        }
+    }
+}
+
+impl fmt::Display for TargetKind {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Ssh => formatter.write_str("Generic SSH host"),
+            Self::Hetzner => formatter.write_str("Hetzner Cloud"),
+        }
+    }
+}
+
+/// Stable data returned to human or JSON output renderers.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct InitSummary {
+    pub config_path: PathBuf,
+    pub project_id: String,
+    pub project_slug: String,
+    pub profile: String,
+    pub compose: Vec<PathBuf>,
+    pub apps: Vec<InitializedApp>,
+    pub target: TargetKind,
+    pub isolation: Isolation,
+}
+
+/// One app created by initialization.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct InitializedApp {
+    pub name: String,
+    pub service: String,
+    pub port: u16,
+}
+
+/// Discovers the current repository and Compose model, prompts when requested,
+/// validates the complete configuration, then writes it atomically.
+///
+/// # Errors
+///
+/// Returns an error when Git or Compose discovery fails, answers are invalid,
+/// a required tool is missing, prompting fails, or configuration cannot be
+/// written safely.
+pub async fn run(options: InitOptions) -> Result<InitSummary, CliError> {
+    let git = lightrail_core::GitContext::discover(&options.start)
+        .map_err(|error| CliError::Usage(error.to_string()))?;
+    let root = git.repo_root();
+    let paths = ProjectPaths::at(root);
+    refuse_existing_config(&paths.config, options.force)?;
+
+    let answers = load_answers(options.answers_file.as_deref(), &options.start).await?;
+    let discovered = discover_compose_files(root)?;
+    let compose =
+        choose_compose_files(root, &discovered, &answers.compose, options.non_interactive)?;
+
+    let inspector = ComposeInspector::new(TokioCommandRunner);
+    let inventory = inspector.inspect(root, &compose).await?;
+    initialize_from_inventory(&options, root, compose, inventory, answers).await
+}
+
+/// Completes initialization from an already-resolved Compose inventory.
+///
+/// This boundary keeps provider-free configuration generation independently
+/// testable and lets callers reuse a cached Compose inspection.
+///
+/// # Errors
+///
+/// Returns an error when the inventory is unsafe for a remote target, answers
+/// do not map to Compose services and ports, validation fails, or project files
+/// cannot be written safely.
+pub async fn initialize_from_inventory(
+    options: &InitOptions,
+    root: &Path,
+    compose: Vec<PathBuf>,
+    inventory: ComposeInventory,
+    mut answers: InitAnswers,
+) -> Result<InitSummary, CliError> {
+    let paths = ProjectPaths::at(root);
+    refuse_existing_config(&paths.config, options.force)?;
+    inventory.validate_remote_safety()?;
+
+    let interactive = !options.non_interactive;
+    let default_slug = default_project_slug(root, inventory.project_name.as_deref())?;
+    let project_slug = choose_project_slug(answers.project_slug.take(), default_slug, interactive)?;
+    let target = choose_target(answers.target, interactive)?;
+    let isolation = answers
+        .isolation
+        .unwrap_or_else(|| target.default_isolation());
+    let apps = choose_apps(&inventory, answers.apps, interactive)?;
+    let app_names = apps.keys().cloned().collect::<Vec<_>>();
+    let settings = build_settings(
+        target,
+        answers.dns_domain.as_deref(),
+        answers.settings,
+        interactive,
+    )?;
+    let pipeline = build_pipeline(target)?;
+
+    let config = LightrailConfig {
+        schema: CONFIG_SCHEMA_VERSION,
+        project: Project {
+            id: ProjectId::new(),
+            slug: project_slug.clone(),
+            compose: compose.clone(),
+            default_profile: options.profile.clone(),
+        },
+        apps,
+        profiles: BTreeMap::from([(
+            options.profile.clone(),
+            Profile {
+                isolation,
+                apps: app_names,
+                pipeline,
+                settings,
+                env: BTreeMap::new(),
+                app_env: BTreeMap::new(),
+            },
+        )]),
+    };
+    let encoded = config
+        .to_toml_pretty()
+        .map_err(|error| CliError::Config(error.to_string()))?;
+    write_config(&paths.config, &encoded, options.force).await?;
+    ensure_lock_file(&paths.lock).await?;
+    ensure_local_state_ignored(root).await?;
+
+    let initialized_apps = config
+        .apps
+        .iter()
+        .map(|(name, app)| InitializedApp {
+            name: name.clone(),
+            service: app.service.clone(),
+            port: app.port,
+        })
+        .collect();
+    Ok(InitSummary {
+        config_path: paths.config,
+        project_id: config.project.id.to_string(),
+        project_slug,
+        profile: options.profile.clone(),
+        compose,
+        apps: initialized_apps,
+        target,
+        isolation,
+    })
+}
+
+/// Finds root-level Compose files in deterministic merge-candidate order.
+///
+/// # Errors
+///
+/// Returns an error when `root` cannot be read or contains no recognized
+/// Compose file.
+pub fn discover_compose_files(root: &Path) -> Result<Vec<PathBuf>, CliError> {
+    let mut candidates = Vec::new();
+    for entry in std::fs::read_dir(root)? {
+        let entry = entry?;
+        if !entry.file_type()?.is_file() {
+            continue;
+        }
+        let Some(name) = entry.file_name().to_str().map(ToOwned::to_owned) else {
+            continue;
+        };
+        if is_compose_filename(&name) {
+            candidates.push(PathBuf::from(name));
+        }
+    }
+    candidates.sort_by_key(|path| compose_sort_key(path));
+    if candidates.is_empty() {
+        return Err(CliError::Config(format!(
+            "no Compose file found in {}; expected compose.yaml, compose.yml, docker-compose.yaml, or docker-compose.yml",
+            root.display()
+        )));
+    }
+    Ok(candidates)
+}
+
+async fn load_answers(path: Option<&Path>, start: &Path) -> Result<InitAnswers, CliError> {
+    let Some(path) = path else {
+        return Ok(InitAnswers::default());
+    };
+    let path = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        start.join(path)
+    };
+    let source = tokio::fs::read_to_string(&path).await.map_err(|error| {
+        CliError::Config(format!(
+            "could not read init answers from {}: {error}",
+            path.display()
+        ))
+    })?;
+    if path
+        .extension()
+        .is_some_and(|extension| extension == "json")
+    {
+        serde_json::from_str(&source).map_err(|error| {
+            CliError::Config(format!(
+                "could not parse JSON init answers in {}: {error}",
+                path.display()
+            ))
+        })
+    } else {
+        toml::from_str(&source).map_err(|error| {
+            CliError::Config(format!(
+                "could not parse TOML init answers in {}: {error}",
+                path.display()
+            ))
+        })
+    }
+}
+
+fn choose_compose_files(
+    root: &Path,
+    discovered: &[PathBuf],
+    requested: &[PathBuf],
+    non_interactive: bool,
+) -> Result<Vec<PathBuf>, CliError> {
+    if !requested.is_empty() {
+        for path in requested {
+            let valid = !path.as_os_str().is_empty()
+                && !path.is_absolute()
+                && path
+                    .components()
+                    .all(|component| matches!(component, std::path::Component::Normal(_)));
+            if !valid || !root.join(path).is_file() {
+                return Err(CliError::Config(format!(
+                    "Compose file `{}` must be an existing normalized path relative to {}",
+                    path.display(),
+                    root.display()
+                )));
+            }
+        }
+        return Ok(requested.to_vec());
+    }
+
+    if non_interactive || discovered.len() == 1 {
+        return discovered
+            .first()
+            .cloned()
+            .map(|path| vec![path])
+            .ok_or_else(|| CliError::Config("no Compose files were discovered".into()));
+    }
+
+    let labels = discovered
+        .iter()
+        .map(|path| path.display().to_string())
+        .collect::<Vec<_>>();
+    let defaults = (0..discovered.len())
+        .map(|index| index == 0)
+        .collect::<Vec<_>>();
+    let selected = MultiSelect::with_theme(&ColorfulTheme::default())
+        .with_prompt("Compose files (merge order follows this list)")
+        .items(&labels)
+        .defaults(&defaults)
+        .interact()
+        .map_err(|error| prompt_error(&error))?;
+    if selected.is_empty() {
+        return Err(CliError::Usage(
+            "initialization needs at least one Compose file".into(),
+        ));
+    }
+    Ok(selected
+        .into_iter()
+        .map(|index| discovered[index].clone())
+        .collect())
+}
+
+fn choose_project_slug(
+    answer: Option<String>,
+    default: String,
+    interactive: bool,
+) -> Result<String, CliError> {
+    if let Some(answer) = answer {
+        return Ok(answer);
+    }
+    if !interactive {
+        return Ok(default);
+    }
+    Input::<String>::with_theme(&ColorfulTheme::default())
+        .with_prompt("Project slug")
+        .default(default)
+        .interact_text()
+        .map_err(|error| prompt_error(&error))
+}
+
+fn choose_target(answer: Option<TargetKind>, interactive: bool) -> Result<TargetKind, CliError> {
+    if let Some(answer) = answer {
+        return Ok(answer);
+    }
+    if !interactive {
+        return Ok(TargetKind::Ssh);
+    }
+    let targets = [TargetKind::Ssh, TargetKind::Hetzner];
+    let selected = Select::with_theme(&ColorfulTheme::default())
+        .with_prompt("Deployment target")
+        .items(&targets)
+        .default(0)
+        .interact()
+        .map_err(|error| prompt_error(&error))?;
+    Ok(targets[selected])
+}
+
+fn choose_apps(
+    inventory: &ComposeInventory,
+    answers: Vec<AppAnswer>,
+    interactive: bool,
+) -> Result<BTreeMap<String, App>, CliError> {
+    if !answers.is_empty() {
+        let mut apps = BTreeMap::new();
+        for answer in answers {
+            let (name, app) = app_from_answer(inventory, answer)?;
+            if apps.insert(name.clone(), app).is_some() {
+                return Err(CliError::Config(format!(
+                    "public app name `{name}` occurs more than once"
+                )));
+            }
+        }
+        return Ok(apps);
+    }
+
+    let candidates = inventory.public_app_candidates();
+    if candidates.is_empty() {
+        return Err(CliError::Config(
+            "Compose has no services with an exposed internal port; add a port or provide explicit [[apps]] answers"
+                .into(),
+        ));
+    }
+
+    let selected = if interactive {
+        select_app_candidates(&candidates)?
+    } else {
+        let likely = candidates
+            .iter()
+            .copied()
+            .filter(|service| likely_public_service(service))
+            .collect::<Vec<_>>();
+        if likely.is_empty() {
+            return Err(CliError::Config(
+                "could not safely infer a public app; provide [[apps]] in an init answers file"
+                    .into(),
+            ));
+        }
+        likely
+    };
+
+    let mut apps = BTreeMap::new();
+    for service in selected {
+        let port = choose_service_port(service, interactive)?;
+        let name = if interactive {
+            Input::<String>::with_theme(&ColorfulTheme::default())
+                .with_prompt(format!("Public app name for `{}`", service.name))
+                .default(service.name.clone())
+                .interact_text()
+                .map_err(|error| prompt_error(&error))?
+        } else {
+            service.name.clone()
+        };
+        let app = App {
+            service: service.name.clone(),
+            port,
+            health_path: None,
+            health_status: None,
+            health_interval_seconds: None,
+            health_timeout_seconds: None,
+            env: BTreeMap::new(),
+        };
+        if apps.insert(name.clone(), app).is_some() {
+            return Err(CliError::Config(format!(
+                "public app name `{name}` occurs more than once"
+            )));
+        }
+    }
+    Ok(apps)
+}
+
+fn select_app_candidates<'a>(
+    candidates: &[&'a ServiceInventory],
+) -> Result<Vec<&'a ServiceInventory>, CliError> {
+    let labels = candidates
+        .iter()
+        .map(|service| {
+            format!(
+                "{} ({})",
+                service.name,
+                service
+                    .internal_ports
+                    .iter()
+                    .map(u16::to_string)
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            )
+        })
+        .collect::<Vec<_>>();
+    let defaults = candidates
+        .iter()
+        .map(|service| likely_public_service(service))
+        .collect::<Vec<_>>();
+    let selected = MultiSelect::with_theme(&ColorfulTheme::default())
+        .with_prompt("Public application services")
+        .items(&labels)
+        .defaults(&defaults)
+        .interact()
+        .map_err(|error| prompt_error(&error))?;
+    if selected.is_empty() {
+        return Err(CliError::Usage(
+            "select at least one public application service".into(),
+        ));
+    }
+    Ok(selected
+        .into_iter()
+        .map(|index| candidates[index])
+        .collect())
+}
+
+fn choose_service_port(service: &ServiceInventory, interactive: bool) -> Result<u16, CliError> {
+    match service.internal_ports.as_slice() {
+        [] => Err(CliError::Config(format!(
+            "service `{}` has no internal port",
+            service.name
+        ))),
+        [port] => Ok(*port),
+        ports if !interactive => Err(CliError::Config(format!(
+            "service `{}` exposes multiple ports ({}); choose one in [[apps]] answers",
+            service.name,
+            ports
+                .iter()
+                .map(u16::to_string)
+                .collect::<Vec<_>>()
+                .join(", ")
+        ))),
+        ports => {
+            let labels = ports.iter().map(u16::to_string).collect::<Vec<_>>();
+            let selected = Select::with_theme(&ColorfulTheme::default())
+                .with_prompt(format!("Internal HTTP port for `{}`", service.name))
+                .items(&labels)
+                .default(0)
+                .interact()
+                .map_err(|error| prompt_error(&error))?;
+            Ok(ports[selected])
+        }
+    }
+}
+
+fn app_from_answer(
+    inventory: &ComposeInventory,
+    answer: AppAnswer,
+) -> Result<(String, App), CliError> {
+    let service = inventory.service(&answer.service).ok_or_else(|| {
+        CliError::Config(format!(
+            "public app refers to unknown Compose service `{}`",
+            answer.service
+        ))
+    })?;
+    let port = match answer.port {
+        Some(port) if service.internal_ports.contains(&port) => port,
+        Some(port) => {
+            return Err(CliError::Config(format!(
+                "port {port} is not exposed internally by Compose service `{}`",
+                answer.service
+            )));
+        }
+        None => match service.internal_ports.as_slice() {
+            [port] => *port,
+            [] => {
+                return Err(CliError::Config(format!(
+                    "Compose service `{}` has no internal port",
+                    answer.service
+                )));
+            }
+            ports => {
+                return Err(CliError::Config(format!(
+                    "Compose service `{}` exposes multiple ports ({}); set `port` in its [[apps]] answer",
+                    answer.service,
+                    ports
+                        .iter()
+                        .map(u16::to_string)
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                )));
+            }
+        },
+    };
+    let name = answer.name.unwrap_or_else(|| answer.service.clone());
+    Ok((
+        name,
+        App {
+            service: answer.service,
+            port,
+            health_path: answer.health_path,
+            health_status: answer.health_status,
+            health_interval_seconds: None,
+            health_timeout_seconds: None,
+            env: BTreeMap::new(),
+        },
+    ))
+}
+
+fn build_pipeline(target: TargetKind) -> Result<PluginPipeline, CliError> {
+    let plugin = |identifier: &str| {
+        PluginId::new(identifier).map_err(|error| CliError::Config(error.to_string()))
+    };
+    Ok(PluginPipeline {
+        source: plugin(COMPOSE_PLUGIN_ID)?,
+        builder: plugin(COMPOSE_PLUGIN_ID)?,
+        target: plugin(target.target_plugin())?,
+        runtime: plugin(COMPOSE_PLUGIN_ID)?,
+        exposure: plugin(COMPOSE_PLUGIN_ID)?,
+        dns: plugin(COMPOSE_PLUGIN_ID)?,
+    })
+}
+
+fn build_settings(
+    target: TargetKind,
+    dns_domain: Option<&str>,
+    answers: BTreeMap<String, toml::Value>,
+    interactive: bool,
+) -> Result<BTreeMap<String, toml::Value>, CliError> {
+    let target_defaults = match target {
+        TargetKind::Ssh => ssh_settings(answers.get("target"), interactive)?,
+        TargetKind::Hetzner => hetzner_settings(answers.get("target"), interactive)?,
+    };
+    let mut settings = BTreeMap::from([
+        ("target".into(), target_defaults),
+        (
+            "exposure".into(),
+            toml::Value::Table(toml::Table::from_iter([
+                ("mode".into(), toml::Value::String("public".into())),
+                ("tls".into(), toml::Value::String("acme-http-01".into())),
+            ])),
+        ),
+        (
+            "dns".into(),
+            toml::Value::Table(toml::Table::from_iter([
+                (
+                    "domain".into(),
+                    toml::Value::String(validate_dns_domain(dns_domain.unwrap_or("sslip.io"))?),
+                ),
+                ("encoding".into(), toml::Value::String("hex-ipv4".into())),
+            ])),
+        ),
+    ]);
+
+    for (capability, answer) in answers {
+        merge_value(
+            settings
+                .entry(capability)
+                .or_insert(toml::Value::Table(toml::Table::new())),
+            answer,
+        );
+    }
+    Ok(settings)
+}
+
+fn ssh_settings(
+    supplied: Option<&toml::Value>,
+    interactive: bool,
+) -> Result<toml::Value, CliError> {
+    let supplied_table = supplied.and_then(toml::Value::as_table);
+    let host = supplied_table
+        .and_then(|table| table.get("host"))
+        .and_then(toml::Value::as_str)
+        .map(ToOwned::to_owned);
+    let user = supplied_table
+        .and_then(|table| table.get("user"))
+        .and_then(toml::Value::as_str)
+        .map(ToOwned::to_owned);
+    let public_ipv4 = supplied_table
+        .and_then(|table| table.get("public_ipv4"))
+        .and_then(toml::Value::as_str)
+        .map(ToOwned::to_owned);
+
+    let host = match (host, interactive) {
+        (Some(host), _) => Some(host),
+        (None, true) => Some(
+            Input::<String>::with_theme(&ColorfulTheme::default())
+                .with_prompt("SSH host or IPv4 address")
+                .interact_text()
+                .map_err(|error| prompt_error(&error))?,
+        ),
+        (None, false) => {
+            return Err(CliError::Config(
+                "generic SSH init needs `settings.target.host` in a non-interactive answers file"
+                    .into(),
+            ));
+        }
+    };
+    let user = match (user, interactive) {
+        (Some(user), _) => Some(user),
+        (None, true) => Some(
+            Input::<String>::with_theme(&ColorfulTheme::default())
+                .with_prompt("SSH user")
+                .default("root".into())
+                .interact_text()
+                .map_err(|error| prompt_error(&error))?,
+        ),
+        (None, false) => None,
+    };
+    if host.as_deref().is_some_and(is_localhost_target) {
+        return Err(CliError::Config(
+            "localhost and loopback SSH targets are not allowed".into(),
+        ));
+    }
+    let host_is_public_ipv4 = host
+        .as_deref()
+        .and_then(|host| host.parse::<std::net::Ipv4Addr>().ok())
+        .is_some_and(is_public_ipv4);
+    let public_ipv4 = match (public_ipv4, host_is_public_ipv4, interactive) {
+        (Some(address), _, _) => Some(address),
+        (None, true, _) => None,
+        (None, false, true) => Some(
+            Input::<String>::with_theme(&ColorfulTheme::default())
+                .with_prompt("Public IPv4 used by sslip.io/nip.io")
+                .interact_text()
+                .map_err(|error| prompt_error(&error))?,
+        ),
+        (None, false, false) => {
+            return Err(CliError::Config(
+                "generic SSH init needs `settings.target.public_ipv4` when host is not itself a public IPv4 address".into(),
+            ));
+        }
+    };
+    if let Some(address) = &public_ipv4 {
+        let parsed = address.parse::<std::net::Ipv4Addr>().map_err(|_| {
+            CliError::Config("`settings.target.public_ipv4` must be an IPv4 address".into())
+        })?;
+        if !is_public_ipv4(parsed) {
+            return Err(CliError::Config(
+                "`settings.target.public_ipv4` must be publicly routable".into(),
+            ));
+        }
+    }
+
+    let mut table =
+        toml::Table::from_iter([("bootstrap".into(), toml::Value::String("auto".into()))]);
+    if let Some(host) = host {
+        table.insert("host".into(), toml::Value::String(host));
+    }
+    if let Some(user) = user {
+        table.insert("user".into(), toml::Value::String(user));
+    }
+    if let Some(public_ipv4) = public_ipv4 {
+        table.insert("public_ipv4".into(), toml::Value::String(public_ipv4));
+    }
+    Ok(toml::Value::Table(table))
+}
+
+fn is_localhost_target(host: &str) -> bool {
+    host.eq_ignore_ascii_case("localhost")
+        || host.to_ascii_lowercase().ends_with(".localhost")
+        || host
+            .parse::<std::net::IpAddr>()
+            .is_ok_and(|address| address.is_loopback())
+}
+
+fn is_public_ipv4(address: std::net::Ipv4Addr) -> bool {
+    !(address.is_private()
+        || address.is_loopback()
+        || address.is_link_local()
+        || address.is_broadcast()
+        || address.is_documentation()
+        || address.is_unspecified()
+        || address.is_multicast()
+        || address.octets()[0] == 0)
+}
+
+fn hetzner_settings(
+    supplied: Option<&toml::Value>,
+    interactive: bool,
+) -> Result<toml::Value, CliError> {
+    let supplied_table = supplied.and_then(toml::Value::as_table);
+    let server_type = supplied_table
+        .and_then(|table| table.get("server_type"))
+        .and_then(toml::Value::as_str)
+        .map(ToOwned::to_owned);
+    let location = supplied_table
+        .and_then(|table| table.get("location"))
+        .and_then(toml::Value::as_str)
+        .map(ToOwned::to_owned);
+    let ssh_keys = supplied_table
+        .and_then(|table| table.get("ssh_keys"))
+        .map(|value| string_list(value, "settings.target.ssh_keys"))
+        .transpose()?;
+    let allowed_ssh_cidrs = supplied_table
+        .and_then(|table| table.get("allowed_ssh_cidrs"))
+        .map(|value| string_list(value, "settings.target.allowed_ssh_cidrs"))
+        .transpose()?;
+
+    let server_type = if interactive && server_type.is_none() {
+        Input::<String>::with_theme(&ColorfulTheme::default())
+            .with_prompt("Hetzner server type")
+            .default("cx23".into())
+            .interact_text()
+            .map_err(|error| prompt_error(&error))?
+    } else {
+        server_type.unwrap_or_else(|| "cx23".into())
+    };
+    let location = if interactive && location.is_none() {
+        Some(
+            Input::<String>::with_theme(&ColorfulTheme::default())
+                .with_prompt("Hetzner location")
+                .default("nbg1".into())
+                .interact_text()
+                .map_err(|error| prompt_error(&error))?,
+        )
+    } else {
+        location
+    };
+    let ssh_keys = match (ssh_keys, interactive) {
+        (Some(keys), _) if !keys.is_empty() => keys,
+        (_, true) => {
+            comma_separated_prompt("Hetzner SSH key names or IDs (comma-separated)", "ssh_keys")?
+        }
+        _ => {
+            return Err(CliError::Config(
+                "Hetzner init needs at least one `settings.target.ssh_keys` entry".into(),
+            ));
+        }
+    };
+    let allowed_ssh_cidrs = match (allowed_ssh_cidrs, interactive) {
+        (Some(cidrs), _) if !cidrs.is_empty() => cidrs,
+        (_, true) => comma_separated_prompt(
+            "CIDRs allowed to reach SSH (for example 198.51.100.42/32)",
+            "allowed_ssh_cidrs",
+        )?,
+        _ => {
+            return Err(CliError::Config(
+                "Hetzner init needs `settings.target.allowed_ssh_cidrs`; use a narrow source CIDR, never 0.0.0.0/0".into(),
+            ));
+        }
+    };
+    validate_ssh_cidrs(&allowed_ssh_cidrs)?;
+
+    let mut table = toml::Table::from_iter([
+        ("server_type".into(), toml::Value::String(server_type)),
+        (
+            "token".into(),
+            toml::Value::Table(toml::Table::from_iter([(
+                "secret".into(),
+                toml::Value::String("hetzner-token".into()),
+            )])),
+        ),
+        ("bootstrap".into(), toml::Value::String("cloud-init".into())),
+        (
+            "ssh_keys".into(),
+            toml::Value::Array(ssh_keys.into_iter().map(toml::Value::String).collect()),
+        ),
+        (
+            "allowed_ssh_cidrs".into(),
+            toml::Value::Array(
+                allowed_ssh_cidrs
+                    .into_iter()
+                    .map(toml::Value::String)
+                    .collect(),
+            ),
+        ),
+    ]);
+    if let Some(location) = location {
+        table.insert("location".into(), toml::Value::String(location));
+    }
+    Ok(toml::Value::Table(table))
+}
+
+fn string_list(value: &toml::Value, field: &str) -> Result<Vec<String>, CliError> {
+    let values = value
+        .as_array()
+        .ok_or_else(|| CliError::Config(format!("`{field}` must be an array of strings")))?;
+    values
+        .iter()
+        .map(|value| {
+            value
+                .as_str()
+                .filter(|value| !value.trim().is_empty())
+                .map(|value| value.trim().to_owned())
+                .ok_or_else(|| {
+                    CliError::Config(format!("`{field}` entries must be non-empty strings"))
+                })
+        })
+        .collect()
+}
+
+fn comma_separated_prompt(prompt: &str, field: &str) -> Result<Vec<String>, CliError> {
+    let value = Input::<String>::with_theme(&ColorfulTheme::default())
+        .with_prompt(prompt)
+        .interact_text()
+        .map_err(|error| prompt_error(&error))?;
+    let values = value
+        .split(',')
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToOwned::to_owned)
+        .collect::<Vec<_>>();
+    if values.is_empty() {
+        return Err(CliError::Config(format!(
+            "`settings.target.{field}` must not be empty"
+        )));
+    }
+    Ok(values)
+}
+
+fn validate_ssh_cidrs(cidrs: &[String]) -> Result<(), CliError> {
+    for cidr in cidrs {
+        let (address, prefix) = cidr.split_once('/').ok_or_else(|| {
+            CliError::Config(format!(
+                "SSH source `{cidr}` must use CIDR notation such as 198.51.100.42/32"
+            ))
+        })?;
+        let address = address.parse::<std::net::IpAddr>().map_err(|_| {
+            CliError::Config(format!("SSH source CIDR `{cidr}` has an invalid address"))
+        })?;
+        let prefix = prefix.parse::<u8>().map_err(|_| {
+            CliError::Config(format!("SSH source CIDR `{cidr}` has an invalid prefix"))
+        })?;
+        let maximum = if address.is_ipv4() { 32 } else { 128 };
+        if prefix > maximum || prefix == 0 {
+            return Err(CliError::Config(format!(
+                "SSH source CIDR `{cidr}` is invalid or world-open"
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn merge_value(base: &mut toml::Value, overlay: toml::Value) {
+    match (base, overlay) {
+        (toml::Value::Table(base), toml::Value::Table(overlay)) => {
+            for (key, value) in overlay {
+                merge_value(
+                    base.entry(key)
+                        .or_insert_with(|| toml::Value::Table(toml::Table::new())),
+                    value,
+                );
+            }
+        }
+        (base, overlay) => *base = overlay,
+    }
+}
+
+fn validate_dns_domain(domain: &str) -> Result<String, CliError> {
+    match domain {
+        "sslip.io" | "nip.io" => Ok(domain.to_owned()),
+        _ => Err(CliError::Config(format!(
+            "unsupported DNS domain `{domain}`; use sslip.io or nip.io"
+        ))),
+    }
+}
+
+fn default_project_slug(root: &Path, compose_name: Option<&str>) -> Result<String, CliError> {
+    let raw = compose_name
+        .filter(|name| !name.is_empty())
+        .map(ToOwned::to_owned)
+        .or_else(|| {
+            root.file_name()
+                .and_then(|name| name.to_str())
+                .map(ToOwned::to_owned)
+        })
+        .ok_or_else(|| CliError::Config("could not infer a project slug".into()))?;
+    DnsLabel::new(&raw)
+        .map(|label| label.as_str().to_owned())
+        .map_err(|error| CliError::Config(error.to_string()))
+}
+
+fn likely_public_service(service: &ServiceInventory) -> bool {
+    const PRIVATE_PORTS: [u16; 8] = [3306, 5432, 5672, 6379, 9200, 11211, 27017, 27018];
+    const PRIVATE_NAMES: [&str; 9] = [
+        "cache", "database", "db", "mongo", "mysql", "postgres", "queue", "rabbitmq", "redis",
+    ];
+    !PRIVATE_NAMES.contains(&service.name.to_ascii_lowercase().as_str())
+        && service
+            .internal_ports
+            .iter()
+            .any(|port| !PRIVATE_PORTS.contains(port))
+}
+
+fn refuse_existing_config(path: &Path, force: bool) -> Result<(), CliError> {
+    if path.exists() && !force {
+        Err(CliError::Usage(format!(
+            "{} already exists; pass --force to replace it",
+            path.display()
+        )))
+    } else {
+        Ok(())
+    }
+}
+
+async fn write_config(path: &Path, contents: &str, force: bool) -> Result<(), CliError> {
+    refuse_existing_config(path, force)?;
+    let project_id = ProjectId::new().simple();
+    let temporary = path.with_file_name(format!(".{CONFIG_FILE}.{project_id}.tmp"));
+    tokio::fs::write(&temporary, contents).await?;
+    if let Err(error) = tokio::fs::rename(&temporary, path).await {
+        let _ = tokio::fs::remove_file(&temporary).await;
+        return Err(error.into());
+    }
+    Ok(())
+}
+
+async fn ensure_local_state_ignored(root: &Path) -> Result<(), CliError> {
+    let path = root.join(".gitignore");
+    let existing = match tokio::fs::read_to_string(&path).await {
+        Ok(existing) => existing,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => String::new(),
+        Err(error) => return Err(error.into()),
+    };
+    if existing
+        .lines()
+        .map(str::trim)
+        .any(|line| matches!(line, ".lightrail" | ".lightrail/"))
+    {
+        return Ok(());
+    }
+    let mut updated = existing;
+    if !updated.is_empty() && !updated.ends_with('\n') {
+        updated.push('\n');
+    }
+    updated.push_str(".lightrail/\n");
+    tokio::fs::write(path, updated).await?;
+    Ok(())
+}
+
+async fn ensure_lock_file(path: &Path) -> Result<(), CliError> {
+    if path.is_file() {
+        PluginLock::load(path).await?;
+    } else {
+        PluginLock::default().save(path).await?;
+    }
+    Ok(())
+}
+
+fn is_compose_filename(name: &str) -> bool {
+    let lower = name.to_ascii_lowercase();
+    let supported_extension = Path::new(name)
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .is_some_and(|extension| {
+            extension.eq_ignore_ascii_case("yaml") || extension.eq_ignore_ascii_case("yml")
+        });
+    supported_extension
+        && (lower == "compose.yaml"
+            || lower == "compose.yml"
+            || lower == "docker-compose.yaml"
+            || lower == "docker-compose.yml"
+            || lower.starts_with("compose.")
+            || lower.starts_with("docker-compose."))
+}
+
+fn compose_sort_key(path: &Path) -> (u8, String) {
+    let name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    let priority = match name.as_str() {
+        "compose.yaml" => 0,
+        "compose.yml" => 1,
+        "docker-compose.yaml" => 2,
+        "docker-compose.yml" => 3,
+        _ => 4,
+    };
+    (priority, name)
+}
+
+fn prompt_error(error: &dialoguer::Error) -> CliError {
+    CliError::Operation(format!("interactive prompt failed: {error}"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::compose::{ComposeDocument, ComposeService, inventory};
+    use serde_json::json;
+
+    fn inventory_fixture() -> ComposeInventory {
+        inventory(ComposeDocument {
+            name: Some("shop".into()),
+            services: BTreeMap::from([
+                (
+                    "db".into(),
+                    ComposeService {
+                        image: Some("postgres:17".into()),
+                        build: None,
+                        ports: Vec::new(),
+                        expose: vec![json!("5432/tcp")],
+                        volumes: Vec::new(),
+                        healthcheck: None,
+                        network_mode: None,
+                    },
+                ),
+                (
+                    "frontend".into(),
+                    ComposeService {
+                        image: None,
+                        build: Some(json!({"context": "."})),
+                        ports: vec![json!({"target": 3000})],
+                        expose: Vec::new(),
+                        volumes: Vec::new(),
+                        healthcheck: Some(json!({"test": ["CMD", "true"]})),
+                        network_mode: None,
+                    },
+                ),
+            ]),
+        })
+    }
+
+    fn options(root: &Path) -> InitOptions {
+        InitOptions {
+            start: root.to_path_buf(),
+            profile: "preview".into(),
+            non_interactive: true,
+            answers_file: None,
+            force: false,
+        }
+    }
+
+    fn noninteractive_ssh_answers() -> InitAnswers {
+        InitAnswers {
+            settings: BTreeMap::from([(
+                "target".into(),
+                toml::Value::Table(toml::Table::from_iter([(
+                    "host".into(),
+                    toml::Value::String("8.8.8.8".into()),
+                )])),
+            )]),
+            ..InitAnswers::default()
+        }
+    }
+
+    #[test]
+    fn rejects_world_open_hetzner_ssh_cidr() {
+        assert!(validate_ssh_cidrs(&["198.51.100.42/32".into()]).is_ok());
+        assert!(validate_ssh_cidrs(&["0.0.0.0/0".into()]).is_err());
+        assert!(validate_ssh_cidrs(&["::/0".into()]).is_err());
+    }
+
+    #[tokio::test]
+    async fn answers_create_a_valid_committed_configuration() {
+        let temp = tempfile::tempdir().expect("temp");
+        tokio::fs::write(temp.path().join("compose.yaml"), "services: {}\n")
+            .await
+            .expect("fixture");
+        let answers = InitAnswers {
+            project_slug: Some("storefront".into()),
+            compose: Vec::new(),
+            target: Some(TargetKind::Ssh),
+            isolation: None,
+            apps: vec![AppAnswer {
+                name: Some("web".into()),
+                service: "frontend".into(),
+                port: Some(3000),
+                health_path: Some("/health".into()),
+                health_status: Some(200),
+            }],
+            dns_domain: Some("nip.io".into()),
+            settings: BTreeMap::from([(
+                "target".into(),
+                toml::Value::Table(toml::Table::from_iter([
+                    ("host".into(), toml::Value::String("8.8.8.8".into())),
+                    ("user".into(), toml::Value::String("deploy".into())),
+                ])),
+            )]),
+        };
+
+        let summary = initialize_from_inventory(
+            &options(temp.path()),
+            temp.path(),
+            vec![PathBuf::from("compose.yaml")],
+            inventory_fixture(),
+            answers,
+        )
+        .await
+        .expect("initialize");
+
+        assert_eq!(summary.project_slug, "storefront");
+        assert_eq!(summary.apps[0].name, "web");
+        let config =
+            LightrailConfig::load(temp.path().join(CONFIG_FILE)).expect("valid persisted config");
+        assert_eq!(config.apps.len(), 1);
+        assert_eq!(config.apps["web"].service, "frontend");
+        let profile = config.default_profile().expect("default").1;
+        assert_eq!(profile.isolation, Isolation::Project);
+        assert_eq!(profile.pipeline.target.as_str(), SSH_PLUGIN_ID);
+        assert_eq!(
+            profile.settings["dns"].as_table().expect("table")["domain"].as_str(),
+            Some("nip.io")
+        );
+        assert!(
+            tokio::fs::read_to_string(temp.path().join(".gitignore"))
+                .await
+                .expect("gitignore")
+                .contains(".lightrail/")
+        );
+        assert_eq!(
+            PluginLock::load(&temp.path().join("lightrail.lock"))
+                .await
+                .expect("lock"),
+            PluginLock::default()
+        );
+    }
+
+    #[tokio::test]
+    async fn init_refuses_to_overwrite_without_explicit_force() {
+        let temp = tempfile::tempdir().expect("temp");
+        tokio::fs::write(temp.path().join("compose.yaml"), "services: {}\n")
+            .await
+            .expect("fixture");
+        let first = options(temp.path());
+        initialize_from_inventory(
+            &first,
+            temp.path(),
+            vec![PathBuf::from("compose.yaml")],
+            inventory_fixture(),
+            noninteractive_ssh_answers(),
+        )
+        .await
+        .expect("first init");
+        let error = initialize_from_inventory(
+            &first,
+            temp.path(),
+            vec![PathBuf::from("compose.yaml")],
+            inventory_fixture(),
+            noninteractive_ssh_answers(),
+        )
+        .await
+        .expect_err("must refuse");
+        assert!(error.to_string().contains("--force"));
+
+        let mut forced = first;
+        forced.force = true;
+        initialize_from_inventory(
+            &forced,
+            temp.path(),
+            vec![PathBuf::from("compose.yaml")],
+            inventory_fixture(),
+            noninteractive_ssh_answers(),
+        )
+        .await
+        .expect("forced replacement");
+    }
+
+    #[test]
+    fn compose_discovery_prefers_canonical_base_file() {
+        let temp = tempfile::tempdir().expect("temp");
+        std::fs::write(temp.path().join("compose.prod.yaml"), "").expect("fixture");
+        std::fs::write(temp.path().join("docker-compose.yml"), "").expect("fixture");
+        std::fs::write(temp.path().join("compose.yaml"), "").expect("fixture");
+        std::fs::write(temp.path().join("notes.yaml"), "").expect("fixture");
+
+        let files = discover_compose_files(temp.path()).expect("discover");
+
+        assert_eq!(
+            files,
+            vec![
+                PathBuf::from("compose.yaml"),
+                PathBuf::from("docker-compose.yml"),
+                PathBuf::from("compose.prod.yaml"),
+            ]
+        );
+    }
+
+    #[test]
+    fn noninteractive_detection_keeps_private_database_internal() {
+        let apps = choose_apps(&inventory_fixture(), Vec::new(), false).expect("apps");
+
+        assert_eq!(apps.len(), 1);
+        assert!(apps.contains_key("frontend"));
+        assert!(!apps.contains_key("db"));
+    }
+
+    #[test]
+    fn localhost_targets_are_rejected_during_initialization() {
+        for host in ["localhost", "api.localhost", "127.0.0.1", "::1"] {
+            assert!(is_localhost_target(host));
+        }
+        assert!(!is_localhost_target("server.example.com"));
+    }
+}

@@ -1,0 +1,24 @@
+[package]
+name = "lightrail-plugin-compose"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Bundled Buildx, Compose, and Traefik capabilities for Lightrail"
+
+[dependencies]
+anyhow.workspace = true
+async-trait.workspace = true
+lightrail-core = { path = "../../crates/lightrail-core" }
+lightrail-plugin-protocol = { path = "../../crates/lightrail-plugin-protocol" }
+reqwest.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+tempfile.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+
+[lints]
+workspace = true

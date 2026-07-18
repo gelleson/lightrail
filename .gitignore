@@ -1,0 +1,5 @@
+/target/
+/.lightrail/
+.env
+.env.*
+!.env.example
