@@ -141,16 +141,10 @@ pub async fn build_and_transfer(
             }
         }
     }
-    let build_source = tempfile::Builder::new()
-        .prefix("lightrail-compose-")
-        .suffix(".json")
-        .tempfile()?;
+    let build_source = temporary_compose_file("lightrail-compose-")?;
     std::fs::write(build_source.path(), serde_json::to_vec(&build_document)?)?;
     let override_value = build_override(&images, target.platform(), desired);
-    let temporary = tempfile::Builder::new()
-        .prefix("lightrail-build-")
-        .suffix(".json")
-        .tempfile()?;
+    let temporary = temporary_compose_file("lightrail-build-")?;
     std::fs::write(temporary.path(), serde_json::to_vec(&override_value)?)?;
 
     let mut arguments = vec![OsString::from("buildx"), OsString::from("bake")];
@@ -184,6 +178,16 @@ pub async fn build_and_transfer(
         }
     }
     Ok(images)
+}
+
+fn temporary_compose_file(prefix: &str) -> Result<tempfile::NamedTempFile, ComposePluginError> {
+    // Buildx selects its Bake parser from the filename. JSON is valid YAML,
+    // but a `.json` suffix is interpreted as native Bake JSON and ignores the
+    // Compose `services` object entirely.
+    Ok(tempfile::Builder::new()
+        .prefix(prefix)
+        .suffix(".compose.yaml")
+        .tempfile()?)
 }
 
 #[allow(clippy::too_many_lines)]
@@ -1701,6 +1705,20 @@ mod tests {
             }]
         }))
         .expect("desired")
+    }
+
+    #[test]
+    fn buildx_bake_inputs_have_a_compose_recognized_suffix() {
+        for prefix in ["lightrail-compose-", "lightrail-build-"] {
+            let temporary = temporary_compose_file(prefix).expect("temporary Compose file");
+            assert!(
+                temporary
+                    .path()
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .is_some_and(|name| name.ends_with(".compose.yaml"))
+            );
+        }
     }
 
     #[test]

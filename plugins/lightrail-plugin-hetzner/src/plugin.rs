@@ -1,5 +1,6 @@
 use std::{
     collections::{HashMap, HashSet},
+    path::Path,
     sync::Mutex as StdMutex,
     time::{Duration, Instant},
 };
@@ -9,10 +10,10 @@ use lightrail_plugin_protocol::{
     ActionJournalEntry, ApplyRequest, ApplyResult, CancelRequest, CancelResult, Capability,
     DestroyRequest, DestroyResult, Diagnostic, DiagnosticSeverity, ErrorKind, EventSink,
     ExecutableMetadata, InspectRequest, InspectResult, JournalStatus, LockAcquireRequest,
-    LockAcquireResult, LockReleaseRequest, LockReleaseResult, LockScope, PlanRequest, PlanResult,
-    PlannedAction, PluginError, PluginEvent, PluginHandler, PluginManifest, PluginResult,
-    ProtocolCompatibility, ResourceStatus, RollbackMetadata, SecretRequirement, SecretValue,
-    ValidateRequest, ValidateResult,
+    LockAcquireResult, LockReleaseRequest, LockReleaseResult, LockScope, OperationContext,
+    PlanRequest, PlanResult, PlannedAction, PluginError, PluginEvent, PluginHandler,
+    PluginManifest, PluginResult, ProtocolCompatibility, ResourceStatus, RollbackMetadata,
+    SecretRequirement, SecretValue, ValidateRequest, ValidateResult,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -21,14 +22,16 @@ use uuid::Uuid;
 
 use crate::{
     api::{
-        ApiAction, ApiClient, CreateFirewall, CreatePublicNet, CreateServer, Firewall, Server,
-        canonical_rules, firewall_rules,
+        ApiAction, ApiClient, CreateFirewall, CreatePublicNet, CreateServer, CreateServerFirewall,
+        Firewall, Server, canonical_rules, firewall_rules,
     },
     model::{
         ENVIRONMENT_LABEL, ResourceIdentity, Settings, config_schema, hash_json, short_hash, token,
         validation,
     },
-    ssh::{SshTarget, acquire_remote_flock, cloud_init, wait_until_ready},
+    ssh::{
+        SshTarget, acquire_remote_flock, cloud_init, prepare_known_hosts_file, wait_until_ready,
+    },
 };
 
 const PLUGIN_ID: &str = "dev.lightrail.hetzner";
@@ -263,22 +266,29 @@ impl PluginHandler for HetznerPlugin {
         let settings = Settings::from_context(&request.context)?;
         let identity = ResourceIdentity::from_context(&request.context)?;
         let token = token(&request.context, &settings)?;
+        let project_root = context_project_root(&request.context)?;
         self.remember_environment_project(&request.context.environment_id, &identity.project_id)
             .await;
         if all_context(&request.context.metadata) {
             let resources = self.project_resources(token, &identity).await?;
-            self.cache_project_snapshot(&identity, &settings, &resources)
-                .await;
-            return aggregate_inspection(&settings, &identity, &resources);
+            self.cache_project_snapshot(&identity, &settings, &resources, project_root)
+                .await?;
+            return aggregate_inspection(&settings, &identity, &resources, project_root);
         }
         let discovery = self.discover(token, &identity).await?;
-        self.cache_environment_snapshot(&request.context.environment_id, &settings, &discovery)
-            .await;
+        self.cache_environment_snapshot(
+            &request.context.environment_id,
+            &settings,
+            &discovery,
+            project_root,
+        )
+        .await?;
         self.inspection_result(
             &request.context.environment_id,
             &settings,
             &identity,
             discovery,
+            project_root,
         )
         .await
     }
@@ -287,6 +297,7 @@ impl PluginHandler for HetznerPlugin {
         let settings = Settings::from_context(&request.context)?;
         let identity = ResourceIdentity::from_context(&request.context)?;
         let token = token(&request.context, &settings)?;
+        let project_root = context_project_root(&request.context)?;
         let present = desired_present(&request.desired, &request.context.metadata);
         let all = all_context(&request.context.metadata);
         self.remember_environment_project(&request.context.environment_id, &identity.project_id)
@@ -299,13 +310,18 @@ impl PluginHandler for HetznerPlugin {
         let mut actions = Vec::new();
         if !present && all {
             let resources = self.project_resources(token, &identity).await?;
-            self.cache_project_snapshot(&identity, &settings, &resources)
-                .await;
+            self.cache_project_snapshot(&identity, &settings, &resources, project_root)
+                .await?;
             project_delete_actions(&resources, &mut actions);
         } else {
             let discovery = self.discover(token, &identity).await?;
-            self.cache_environment_snapshot(&request.context.environment_id, &settings, &discovery)
-                .await;
+            self.cache_environment_snapshot(
+                &request.context.environment_id,
+                &settings,
+                &discovery,
+                project_root,
+            )
+            .await?;
             if present {
                 Self::plan_present(&settings, &discovery, &mut actions);
             } else {
@@ -345,6 +361,7 @@ impl PluginHandler for HetznerPlugin {
             })?;
         metadata.settings.validate()?;
         let identity = ResourceIdentity::from_context(&request.context)?;
+        let project_root = context_project_root(&request.context)?.to_path_buf();
         let (lock_scope, lock_scope_id) = if metadata.all {
             (LockScope::Project, identity.project_id.as_str())
         } else {
@@ -413,6 +430,7 @@ impl PluginHandler for HetznerPlugin {
                 token,
                 &identity,
                 &metadata.settings,
+                &project_root,
                 initial,
                 request.journal,
                 events,
@@ -796,16 +814,28 @@ impl HetznerPlugin {
         token: &str,
         identity: &ResourceIdentity,
         settings: &Settings,
+        project_root: &Path,
         mut discovery: Discovery,
         mut journal: Vec<ActionJournalEntry>,
         events: &EventSink,
     ) -> PluginResult<(TargetState, Vec<ActionJournalEntry>)> {
         let expected_config = settings.config_fingerprint();
-        if discovery.server.as_ref().is_some_and(|server| {
+        let server_requires_replacement = discovery.server.as_ref().is_some_and(|server| {
             server
                 .config_fingerprint()
                 .is_none_or(|actual| actual != &expected_config[..32])
-        }) {
+        });
+        let mut resolved_ssh_key_ids = if discovery.server.is_none() || server_requires_replacement
+        {
+            Some(
+                self.api
+                    .resolve_ssh_key_ids(token, &settings.ssh_keys)
+                    .await?,
+            )
+        } else {
+            None
+        };
+        if server_requires_replacement {
             journal = self
                 .delete_discovery(
                     token,
@@ -918,6 +948,14 @@ impl HetznerPlugin {
         let server = if let Some(server) = rechecked.server {
             server
         } else {
+            let ssh_key_ids = match resolved_ssh_key_ids.take() {
+                Some(ids) => ids,
+                None => {
+                    self.api
+                        .resolve_ssh_key_ids(token, &settings.ssh_keys)
+                        .await?
+                }
+            };
             journal_event(
                 &mut journal,
                 events,
@@ -931,7 +969,13 @@ impl HetznerPlugin {
                 .api
                 .create_server(
                     token,
-                    &server_payload(settings, identity, &firewall, &expected_config),
+                    &server_payload(
+                        settings,
+                        identity,
+                        &firewall,
+                        &ssh_key_ids,
+                        &expected_config,
+                    ),
                 )
                 .await;
             let (server, message) = match create_result {
@@ -1010,8 +1054,15 @@ impl HetznerPlugin {
                 "the server does not yet have a public IPv4 address",
             )
         })?;
-        let target =
-            SshTarget::from_parts(host, settings, identity.remote_root.clone(), environment_id);
+        let known_hosts_file =
+            prepare_known_hosts_file(project_root, &identity.environment_label, server.id)?;
+        let target = SshTarget::from_parts(
+            host,
+            settings,
+            identity.remote_root.clone(),
+            environment_id,
+            known_hosts_file,
+        );
         self.targets
             .lock()
             .await
@@ -1041,6 +1092,7 @@ impl HetznerPlugin {
             discovery.firewall.as_ref(),
             settings,
             identity,
+            &target.known_hosts_file,
         );
         Ok((state, journal))
     }
@@ -1051,6 +1103,7 @@ impl HetznerPlugin {
         settings: &Settings,
         identity: &ResourceIdentity,
         discovery: Discovery,
+        project_root: &Path,
     ) -> PluginResult<InspectResult> {
         let mut diagnostics = Vec::new();
         let Some(server) = discovery.server.as_ref() else {
@@ -1084,7 +1137,15 @@ impl HetznerPlugin {
                 help: Some("Run `lightrail up` to reconcile the target.".to_owned()),
             });
         }
-        let state = target_state(server, discovery.firewall.as_ref(), settings, identity);
+        let known_hosts_file =
+            prepare_known_hosts_file(project_root, &identity.environment_label, server.id)?;
+        let state = target_state(
+            server,
+            discovery.firewall.as_ref(),
+            settings,
+            identity,
+            &known_hosts_file,
+        );
         let status = if server.status == "running"
             && !state.public_ipv4.is_empty()
             && discovery.firewall.is_some()
@@ -1106,6 +1167,7 @@ impl HetznerPlugin {
                     settings,
                     identity.remote_root.clone(),
                     environment_id,
+                    known_hosts_file,
                 ),
             );
         }
@@ -1162,15 +1224,18 @@ impl HetznerPlugin {
         environment_id: &str,
         settings: &Settings,
         discovery: &Discovery,
-    ) {
+        project_root: &Path,
+    ) -> PluginResult<()> {
         let resources = ProjectResources {
             servers: discovery.server.iter().cloned().collect(),
             firewalls: discovery.firewall.iter().cloned().collect(),
         };
-        self.lock_snapshots.lock().await.insert(
-            scope_key(LockScope::Environment, environment_id),
-            resource_snapshot(settings, &resources),
-        );
+        let snapshot = resource_snapshot(settings, &resources, project_root)?;
+        self.lock_snapshots
+            .lock()
+            .await
+            .insert(scope_key(LockScope::Environment, environment_id), snapshot);
+        Ok(())
     }
 
     async fn cache_project_snapshot(
@@ -1178,8 +1243,9 @@ impl HetznerPlugin {
         identity: &ResourceIdentity,
         settings: &Settings,
         resources: &ProjectResources,
-    ) {
-        let snapshot = resource_snapshot(settings, resources);
+        project_root: &Path,
+    ) -> PluginResult<()> {
+        let snapshot = resource_snapshot(settings, resources, project_root)?;
         let mut snapshots = self.lock_snapshots.lock().await;
         snapshots.insert(
             scope_key(LockScope::Project, &identity.project_id),
@@ -1189,6 +1255,7 @@ impl HetznerPlugin {
             scope_key(LockScope::Target, &format!("target:{PLUGIN_ID}")),
             snapshot,
         );
+        Ok(())
     }
 
     async fn verify_project_snapshot(
@@ -1652,6 +1719,7 @@ fn target_state(
     firewall: Option<&Firewall>,
     settings: &Settings,
     identity: &ResourceIdentity,
+    known_hosts_file: &Path,
 ) -> TargetState {
     let public_ipv4 = server.public_ipv4().unwrap_or_default().to_owned();
     let architecture = server.architecture().to_owned();
@@ -1667,7 +1735,7 @@ fn target_state(
             .identity_file
             .as_ref()
             .map(|path| path.to_string_lossy().into_owned()),
-        known_hosts_file: None,
+        known_hosts_file: Some(known_hosts_file.to_string_lossy().into_owned()),
         docker: DockerTargetState {
             requires_sudo: false,
         },
@@ -1690,6 +1758,7 @@ fn aggregate_inspection(
     settings: &Settings,
     identity: &ResourceIdentity,
     resources: &ProjectResources,
+    project_root: &Path,
 ) -> PluginResult<InspectResult> {
     let mut diagnostics = Vec::new();
     let mut targets = Vec::new();
@@ -1727,11 +1796,14 @@ fn aggregate_inspection(
             ),
             remote_root: format!("/opt/lightrail/{environment_label}"),
         };
+        let known_hosts_file =
+            prepare_known_hosts_file(project_root, &environment_label, server.id)?;
         let mut state = serde_json::to_value(target_state(
             server,
             firewall,
             settings,
             &synthetic_identity,
+            &known_hosts_file,
         ))
         .map_err(|error| internal_json(&error))?;
         if let Some(object) = state.as_object_mut() {
@@ -1804,11 +1876,15 @@ fn project_delete_actions(resources: &ProjectResources, actions: &mut Vec<Planne
     }
 }
 
-fn resource_snapshot(settings: &Settings, resources: &ProjectResources) -> ResourceSnapshot {
+fn resource_snapshot(
+    settings: &Settings,
+    resources: &ProjectResources,
+    project_root: &Path,
+) -> PluginResult<ResourceSnapshot> {
     let targets = resources
         .servers
         .iter()
-        .map(|server| {
+        .map(|server| -> PluginResult<SnapshotTarget> {
             let environment_label = server.labels.get(ENVIRONMENT_LABEL);
             let lock_key = environment_label
                 .and_then(|label| label.strip_prefix("e-"))
@@ -1816,26 +1892,40 @@ fn resource_snapshot(settings: &Settings, resources: &ProjectResources) -> Resou
                     || short_hash(&format!("server:{}", server.id), 32),
                     ToOwned::to_owned,
                 );
-            let target = server.public_ipv4().map(|host| {
-                let remote_root = environment_label.map_or_else(
-                    || format!("/opt/lightrail/server-{}", server.id),
-                    |label| format!("/opt/lightrail/{label}"),
-                );
-                let mut target = SshTarget::from_parts(host, settings, remote_root, &lock_key);
-                target.lock_key = lock_key;
-                target
-            });
-            SnapshotTarget {
+            let target = server
+                .public_ipv4()
+                .map(|host| {
+                    let remote_root = environment_label.map_or_else(
+                        || format!("/opt/lightrail/server-{}", server.id),
+                        |label| format!("/opt/lightrail/{label}"),
+                    );
+                    let known_hosts_file = prepare_known_hosts_file(
+                        project_root,
+                        environment_label.map_or(lock_key.as_str(), String::as_str),
+                        server.id,
+                    )?;
+                    let mut target = SshTarget::from_parts(
+                        host,
+                        settings,
+                        remote_root,
+                        &lock_key,
+                        known_hosts_file,
+                    );
+                    target.lock_key = lock_key;
+                    Ok(target)
+                })
+                .transpose()?;
+            Ok(SnapshotTarget {
                 server_id: server.id,
                 target,
-            }
+            })
         })
-        .collect();
-    ResourceSnapshot {
+        .collect::<PluginResult<Vec<_>>>()?;
+    Ok(ResourceSnapshot {
         server_ids: sorted_server_ids(&resources.servers),
         firewall_ids: sorted_firewall_ids(&resources.firewalls),
         targets,
-    }
+    })
 }
 
 fn sorted_server_ids(servers: &[Server]) -> Vec<u64> {
@@ -2086,10 +2176,28 @@ fn all_context(operation_metadata: &Value) -> bool {
         .unwrap_or(false)
 }
 
+fn context_project_root(context: &OperationContext) -> PluginResult<&Path> {
+    let value = context.project_root.as_deref().ok_or_else(|| {
+        validation(
+            "project_root_required",
+            "the Hetzner target requires an absolute project root for scoped SSH host-key state",
+        )
+    })?;
+    let path = Path::new(value);
+    if !path.is_absolute() {
+        return Err(validation(
+            "project_root_not_absolute",
+            "the Hetzner target requires an absolute project root",
+        ));
+    }
+    Ok(path)
+}
+
 fn server_payload(
     settings: &Settings,
     identity: &ResourceIdentity,
     firewall: &Firewall,
+    ssh_key_ids: &[u64],
     fingerprint: &str,
 ) -> CreateServer {
     CreateServer {
@@ -2097,9 +2205,11 @@ fn server_payload(
         server_type: settings.server_type.clone(),
         image: settings.image.clone(),
         location: settings.location.clone(),
-        ssh_keys: settings.ssh_keys.clone(),
+        ssh_keys: ssh_key_ids.to_vec(),
         labels: identity.labels(fingerprint),
-        firewalls: vec![firewall.id],
+        firewalls: vec![CreateServerFirewall {
+            firewall: firewall.id,
+        }],
         user_data: cloud_init(settings, &identity.remote_root),
         start_after_create: true,
         public_net: CreatePublicNet {
@@ -2241,11 +2351,12 @@ fn config_error_path(_details: &Value) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
-    use std::{collections::BTreeMap, process::Stdio};
+    use std::{collections::BTreeMap, path::PathBuf, process::Stdio};
 
     use super::*;
     use crate::api::{AppliedServer, AppliedTo, PublicIpv4, PublicNet, ServerType};
     use crate::model::CONFIG_LABEL;
+    use tempfile::tempdir;
 
     fn settings() -> Settings {
         Settings {
@@ -2315,23 +2426,33 @@ mod tests {
             &settings,
             &identity(),
             &firewall(),
+            &[41],
             &settings.config_fingerprint(),
         );
-        let encoded = serde_json::to_string(&payload).unwrap();
-        assert!(encoded.contains("\"firewalls\":[8]"));
-        assert!(encoded.contains("\"enable_ipv4\":true"));
-        assert!(encoded.contains("#cloud-config"));
+        let encoded = serde_json::to_value(&payload).unwrap();
+        assert_eq!(encoded["ssh_keys"], json!([41]));
+        assert_eq!(encoded["firewalls"], json!([{"firewall": 8}]));
+        assert_eq!(encoded["public_net"]["enable_ipv4"], true);
+        assert!(
+            encoded["user_data"]
+                .as_str()
+                .is_some_and(|user_data| user_data.contains("#cloud-config"))
+        );
+        let encoded = encoded.to_string();
         assert!(!encoded.contains("hetzner-token"));
         assert!(!encoded.contains("actual-provider-token"));
     }
 
     #[test]
     fn target_state_is_compatible_with_agentless_ssh_runtime() {
+        let known_hosts_file =
+            Path::new("/tmp/project/.lightrail/known_hosts/hetzner-env-server-7");
         let value = serde_json::to_value(target_state(
             &server(),
             Some(&firewall()),
             &settings(),
             &identity(),
+            known_hosts_file,
         ))
         .unwrap();
         assert_eq!(value["kind"], "ssh");
@@ -2342,7 +2463,10 @@ mod tests {
         assert_eq!(value["platform"], "linux/arm64");
         assert_eq!(value["isolation"], "machine");
         assert_eq!(value["remote_root"], "/opt/lightrail/e-def");
-        assert!(value["known_hosts_file"].is_null());
+        assert_eq!(
+            value["known_hosts_file"],
+            known_hosts_file.to_string_lossy().as_ref()
+        );
         assert_eq!(value["docker"]["requires_sudo"], false);
     }
 
@@ -2369,11 +2493,13 @@ mod tests {
 
     #[test]
     fn project_aggregate_reports_every_owned_resource_without_raw_environment_id() {
+        let project = tempdir().unwrap();
         let resources = ProjectResources {
             servers: vec![server()],
             firewalls: vec![firewall()],
         };
-        let inspection = aggregate_inspection(&settings(), &identity(), &resources).unwrap();
+        let inspection =
+            aggregate_inspection(&settings(), &identity(), &resources, project.path()).unwrap();
         assert_eq!(inspection.status, ResourceStatus::Ready);
         assert_eq!(inspection.state["server_count"], 1);
         assert_eq!(inspection.state["firewall_count"], 1);
@@ -2487,6 +2613,7 @@ mod tests {
             &settings(),
             "/opt/lightrail/e-def",
             "environment",
+            PathBuf::from("/tmp/project/.lightrail/known_hosts/server-7"),
         );
         target.lock_key = short_hash("environment", 32);
         let snapshot = ResourceSnapshot {
@@ -2504,6 +2631,7 @@ mod tests {
 
     #[test]
     fn project_lock_uses_every_environment_key_in_server_order() {
+        let project = tempdir().unwrap();
         let mut later_server = server();
         later_server.id = 9;
         later_server
@@ -2513,7 +2641,7 @@ mod tests {
             servers: vec![later_server, server()],
             firewalls: vec![firewall()],
         };
-        let snapshot = resource_snapshot(&settings(), &resources);
+        let snapshot = resource_snapshot(&settings(), &resources, project.path()).unwrap();
         let targets = remote_lock_targets(&snapshot).unwrap();
         assert_eq!(targets.len(), 2);
         assert_eq!(targets[0].0, 7);

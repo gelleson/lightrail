@@ -160,7 +160,7 @@ fn default_dns_domain() -> String {
 }
 
 fn default_ingress_image() -> String {
-    "traefik:v3.3".to_owned()
+    "traefik:v3.7.8".to_owned()
 }
 
 fn default_ingress_network() -> String {
@@ -511,8 +511,8 @@ impl TargetState {
                 "remote_root is empty or contains control characters".to_owned(),
             ));
         }
-        validate_local_ssh_path("identity_file", self.identity_file.as_deref(), false)?;
-        validate_local_ssh_path("known_hosts_file", self.known_hosts_file.as_deref(), true)?;
+        validate_local_ssh_path("identity_file", self.identity_file.as_deref())?;
+        validate_local_ssh_path("known_hosts_file", self.known_hosts_file.as_deref())?;
         Ok(())
     }
 
@@ -556,22 +556,12 @@ impl TargetState {
     }
 }
 
-fn validate_local_ssh_path(
-    name: &str,
-    path: Option<&Path>,
-    option_value: bool,
-) -> Result<(), ComposePluginError> {
+fn validate_local_ssh_path(name: &str, path: Option<&Path>) -> Result<(), ComposePluginError> {
     let Some(path) = path else {
         return Ok(());
     };
     let value = path.to_string_lossy();
-    if !path.is_absolute()
-        || value.is_empty()
-        || value.bytes().any(|byte| byte.is_ascii_control())
-        || (option_value
-            && value
-                .bytes()
-                .any(|byte| byte.is_ascii_whitespace() || byte == b'='))
+    if !path.is_absolute() || value.is_empty() || value.bytes().any(|byte| byte.is_ascii_control())
     {
         return Err(ComposePluginError::InvalidTarget(format!(
             "{name} must be an absolute local path without unsafe option characters"
@@ -676,7 +666,7 @@ mod tests {
     }
 
     #[test]
-    fn rejects_relative_or_option_injecting_ssh_paths() {
+    fn rejects_relative_or_control_character_ssh_paths() {
         for target in [
             json!({
                 "host": "8.8.8.8",
@@ -686,11 +676,21 @@ mod tests {
             json!({
                 "host": "8.8.8.8",
                 "public_ipv4": "8.8.8.8",
-                "known_hosts_file": "/tmp/known_hosts ProxyCommand=bad"
+                "known_hosts_file": "/tmp/known_hosts\nProxyCommand=bad"
             }),
         ] {
             assert!(TargetState::from_value(&target).is_err());
         }
+    }
+
+    #[test]
+    fn accepts_quotable_known_hosts_paths() {
+        let target = json!({
+            "host": "8.8.8.8",
+            "public_ipv4": "8.8.8.8",
+            "known_hosts_file": "/tmp/My Project=100%/known_hosts"
+        });
+        assert!(TargetState::from_value(&target).is_ok());
     }
 
     #[test]

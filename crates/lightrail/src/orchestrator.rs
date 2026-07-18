@@ -1688,7 +1688,7 @@ async fn rollback_after_failure(
                 .cloned()
                 .unwrap_or_else(|| json!({}));
         } else {
-            context.secrets.clear();
+            scope_rollback_cleanup_secrets(item.capability, &mut context.secrets);
         }
         context.metadata["operation"] = Value::String(operation.into());
         context.metadata["target"] = target_state.clone();
@@ -1724,6 +1724,18 @@ async fn rollback_after_failure(
         .save(&project.paths.local.join("operations"))
         .await?;
     Ok(())
+}
+
+fn scope_rollback_cleanup_secrets(
+    capability: CoreCapability,
+    secrets: &mut BTreeMap<String, SecretValue>,
+) {
+    // Target contexts contain only provider secrets explicitly declared by
+    // that plugin and resolved for the target capability. Provider cleanup
+    // needs those credentials. Runtime cleanup must not receive app secrets.
+    if capability != CoreCapability::Target {
+        secrets.clear();
+    }
 }
 
 fn prior_runtime_revision(item: &PreparedCapability) -> Option<&str> {
@@ -2257,6 +2269,28 @@ mod tests {
         assert_eq!(
             names,
             BTreeSet::from(["database-url".into(), "hetzner-token".into()])
+        );
+    }
+
+    #[test]
+    fn rollback_cleanup_keeps_target_credentials_and_clears_runtime_secrets() {
+        let provider_token = SecretValue::new("provider-token");
+        let mut target_secrets = BTreeMap::from([("hetzner-token".into(), provider_token.clone())]);
+        scope_rollback_cleanup_secrets(CoreCapability::Target, &mut target_secrets);
+        assert_eq!(
+            target_secrets.get("hetzner-token"),
+            Some(&provider_token),
+            "target cleanup needs its already-scoped provider credential"
+        );
+
+        let mut runtime_secrets = BTreeMap::from([(
+            "database-url".into(),
+            SecretValue::new("runtime-application-secret"),
+        )]);
+        scope_rollback_cleanup_secrets(CoreCapability::Runtime, &mut runtime_secrets);
+        assert!(
+            runtime_secrets.is_empty(),
+            "runtime cleanup must not receive application secrets"
         );
     }
 

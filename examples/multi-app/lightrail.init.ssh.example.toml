@@ -1,0 +1,27 @@
+# Copy this file to lightrail.init.toml and replace both REPLACE values.
+# No private key or credential belongs in this file; OpenSSH can use your agent.
+project_slug = "multi-example"
+compose = ["compose.yaml"]
+target = "ssh"
+isolation = "project"
+dns_domain = "nip.io"
+
+[[apps]]
+name = "frontend"
+service = "frontend"
+port = 8080
+health_path = "/health"
+health_status = 200
+
+[[apps]]
+name = "api"
+service = "api"
+port = 8080
+health_path = "/health"
+health_status = 200
+
+[settings.target]
+host = "REPLACE-WITH-REMOTE-HOST"
+user = "deploy"
+public_ipv4 = "REPLACE-WITH-PUBLIC-IPV4"
+bootstrap = "auto"

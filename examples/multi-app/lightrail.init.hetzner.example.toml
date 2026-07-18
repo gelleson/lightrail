@@ -1,0 +1,28 @@
+# Copy this file to lightrail.init.toml and replace both REPLACE values.
+# Store the API token with `lightrail secret set hetzner-token`; never put it here.
+project_slug = "multi-example"
+compose = ["compose.yaml"]
+target = "hetzner"
+isolation = "machine"
+dns_domain = "nip.io"
+
+[[apps]]
+name = "frontend"
+service = "frontend"
+port = 8080
+health_path = "/health"
+health_status = 200
+
+[[apps]]
+name = "api"
+service = "api"
+port = 8080
+health_path = "/health"
+health_status = 200
+
+[settings.target]
+server_type = "cx23"
+location = "nbg1"
+ssh_keys = ["REPLACE-WITH-HETZNER-SSH-KEY"]
+allowed_ssh_cidrs = ["REPLACE-WITH-PUBLIC-IPV4/32"]
+# identity_file = "/absolute/path/to/the/matching/private-key"

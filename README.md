@@ -21,10 +21,12 @@ an image registry, a remote Lightrail daemon, or a central control plane.
 
 > [!CAUTION]
 > The CLI, protocol, and bundled Compose, SSH, and Hetzner plugins are
-> implemented and covered by automated tests, but this repository has not yet
-> completed a live end-to-end deployment against a real generic SSH host or
-> Hetzner account. Treat the current release as pre-production, especially for
-> destructive provider operations and certificate issuance.
+> implemented and covered by automated tests. The multi-app Hetzner path also
+> completed a live end-to-end smoke test on 2026-07-18, including provisioning,
+> local Buildx builds, SSH image transfer, Compose deployment, ACME HTTP-01,
+> trusted HTTPS for both apps, repeated reconciliation, and normal teardown.
+> A generic SSH host has not yet received the same live validation. Treat the
+> current release as pre-production, especially for destructive operations.
 
 ## What is implemented
 
@@ -175,6 +177,19 @@ lightrail up --dry-run
 
 The generated configuration contains only a reference to `hetzner-token`; the
 value is stored outside committed configuration.
+
+## Examples
+
+The repository includes copy-ready Compose projects for two common application
+shapes:
+
+- [`examples/single-app`](examples/single-app) exposes one `hello` app.
+- [`examples/multi-app`](examples/multi-app) exposes separate `frontend` and
+  `api` branch subdomains.
+
+Each example includes generic SSH and Hetzner init-answer templates. Copy an
+example into its own Git repository before running it so Lightrail uses that
+repository's current branch; no GitHub remote is required.
 
 ## Commands
 

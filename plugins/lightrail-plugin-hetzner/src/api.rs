@@ -1,4 +1,7 @@
-use std::{collections::BTreeMap, time::Duration};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    time::Duration,
+};
 
 use lightrail_plugin_protocol::{ErrorKind, PluginError, PluginResult};
 use reqwest::{Method, RequestBuilder, StatusCode};
@@ -86,6 +89,33 @@ impl ApiClient {
                 None => return Ok(output),
             }
         }
+    }
+
+    pub async fn ssh_keys(&self, token: &str) -> PluginResult<Vec<SshKey>> {
+        let mut page = 1_u64;
+        let mut output = Vec::new();
+        loop {
+            let response: SshKeyList = self
+                .decode(
+                    self.request(Method::GET, "ssh_keys", token)
+                        .query(&[("per_page", "50"), ("page", &page.to_string())]),
+                )
+                .await?;
+            output.extend(response.ssh_keys);
+            match response.meta.and_then(|meta| meta.pagination.next_page) {
+                Some(next) => page = next,
+                None => return Ok(output),
+            }
+        }
+    }
+
+    pub async fn resolve_ssh_key_ids(
+        &self,
+        token: &str,
+        references: &[String],
+    ) -> PluginResult<Vec<u64>> {
+        let keys = self.ssh_keys(token).await?;
+        resolve_ssh_key_references(references, &keys)
     }
 
     pub async fn server(&self, token: &str, id: u64) -> PluginResult<Option<Server>> {
@@ -315,6 +345,12 @@ struct FirewallList {
 }
 
 #[derive(Clone, Debug, Deserialize)]
+struct SshKeyList {
+    ssh_keys: Vec<SshKey>,
+    meta: Option<PaginationEnvelope>,
+}
+
+#[derive(Clone, Debug, Deserialize)]
 struct ServerResponse {
     server: Server,
 }
@@ -354,6 +390,51 @@ pub struct ApiAction {
 pub struct ActionError {
     pub code: String,
     pub message: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
+pub struct SshKey {
+    pub id: u64,
+    pub name: String,
+}
+
+pub fn resolve_ssh_key_references(
+    references: &[String],
+    available: &[SshKey],
+) -> PluginResult<Vec<u64>> {
+    let mut resolved = Vec::with_capacity(references.len());
+    let mut seen = BTreeSet::new();
+    for reference in references {
+        let numeric_id = reference.parse::<u64>().ok();
+        let matches = available
+            .iter()
+            .filter(|key| Some(key.id) == numeric_id || key.name == *reference)
+            .map(|key| key.id)
+            .collect::<BTreeSet<_>>();
+        let id = match matches.len() {
+            0 => {
+                return Err(PluginError::permanent(
+                    ErrorKind::NotFound,
+                    "ssh_key_not_found",
+                    format!("configured Hetzner SSH key `{reference}` was not found"),
+                ));
+            }
+            1 => *matches.first().expect("one SSH key match exists"),
+            _ => {
+                return Err(PluginError::permanent(
+                    ErrorKind::Conflict,
+                    "ssh_key_ambiguous",
+                    format!(
+                        "configured Hetzner SSH key `{reference}` matches multiple keys; use an unambiguous numeric key ID"
+                    ),
+                ));
+            }
+        };
+        if seen.insert(id) {
+            resolved.push(id);
+        }
+    }
+    Ok(resolved)
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -542,12 +623,17 @@ pub struct CreateServer {
     pub image: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub location: Option<String>,
-    pub ssh_keys: Vec<String>,
+    pub ssh_keys: Vec<u64>,
     pub labels: BTreeMap<String, String>,
-    pub firewalls: Vec<u64>,
+    pub firewalls: Vec<CreateServerFirewall>,
     pub user_data: String,
     pub start_after_create: bool,
     pub public_net: CreatePublicNet,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+pub struct CreateServerFirewall {
+    pub firewall: u64,
 }
 
 #[derive(Clone, Copy, Debug, Serialize)]
@@ -558,8 +644,126 @@ pub struct CreatePublicNet {
 
 #[cfg(test)]
 mod tests {
+    use std::{
+        io::{Read, Write},
+        net::{TcpListener, TcpStream},
+        sync::mpsc::{self, Receiver},
+        thread::{self, JoinHandle},
+        time::{Duration, Instant},
+    };
+
     use super::*;
     use crate::model::Settings;
+
+    #[derive(Debug)]
+    struct CapturedRequest {
+        head: String,
+        body: Vec<u8>,
+    }
+
+    fn spawn_mock_api(
+        responses: Vec<serde_json::Value>,
+    ) -> (String, Receiver<CapturedRequest>, JoinHandle<usize>) {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind mock API");
+        listener
+            .set_nonblocking(true)
+            .expect("configure mock API listener");
+        let address = listener.local_addr().expect("mock API address");
+        let (requests, captured) = mpsc::channel();
+        let server = thread::spawn(move || {
+            let deadline = Instant::now() + Duration::from_secs(5);
+            let mut served = 0;
+            for response in responses {
+                let (mut stream, _) = loop {
+                    match listener.accept() {
+                        Ok(connection) => break connection,
+                        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                            if Instant::now() >= deadline {
+                                return served;
+                            }
+                            thread::sleep(Duration::from_millis(5));
+                        }
+                        Err(error) => panic!("accept mock API request: {error}"),
+                    }
+                };
+                stream
+                    .set_read_timeout(Some(Duration::from_secs(2)))
+                    .expect("configure mock API connection");
+                let request = read_request(&mut stream).expect("read mock API request");
+                requests.send(request).expect("capture mock API request");
+                let body = response.to_string();
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                stream
+                    .write_all(response.as_bytes())
+                    .expect("write mock API response");
+                served += 1;
+            }
+            served
+        });
+        (format!("http://{address}/v1"), captured, server)
+    }
+
+    fn read_request(stream: &mut TcpStream) -> std::io::Result<CapturedRequest> {
+        let mut received = Vec::new();
+        let mut buffer = [0_u8; 4096];
+        let header_end = loop {
+            if let Some(index) = received.windows(4).position(|window| window == b"\r\n\r\n") {
+                break index + 4;
+            }
+            let count = stream.read(&mut buffer)?;
+            if count == 0 {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::UnexpectedEof,
+                    "request ended before its headers",
+                ));
+            }
+            received.extend_from_slice(&buffer[..count]);
+        };
+        let head = String::from_utf8_lossy(&received[..header_end]).into_owned();
+        let content_length = head
+            .lines()
+            .find_map(|line| {
+                line.split_once(':')
+                    .filter(|(name, _)| name.eq_ignore_ascii_case("content-length"))
+                    .and_then(|(_, value)| value.trim().parse::<usize>().ok())
+            })
+            .unwrap_or(0);
+        while received.len() < header_end.saturating_add(content_length) {
+            let count = stream.read(&mut buffer)?;
+            if count == 0 {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::UnexpectedEof,
+                    "request ended before its body",
+                ));
+            }
+            received.extend_from_slice(&buffer[..count]);
+        }
+        Ok(CapturedRequest {
+            head,
+            body: received[header_end..header_end + content_length].to_vec(),
+        })
+    }
+
+    fn create_server_payload() -> CreateServer {
+        CreateServer {
+            name: "lr-schema-test".to_owned(),
+            server_type: "cx23".to_owned(),
+            image: "ubuntu-24.04".to_owned(),
+            location: Some("nbg1".to_owned()),
+            ssh_keys: vec![41, 42],
+            labels: BTreeMap::from([("lightrail-managed".to_owned(), "true".to_owned())]),
+            firewalls: vec![CreateServerFirewall { firewall: 8 }],
+            user_data: "#cloud-config\n".to_owned(),
+            start_after_create: true,
+            public_net: CreatePublicNet {
+                enable_ipv4: true,
+                enable_ipv6: true,
+            },
+        }
+    }
 
     #[test]
     fn firewall_payload_only_opens_web_globally() {
@@ -602,6 +806,150 @@ mod tests {
         assert_eq!(server.public_ipv4(), Some("203.0.113.7"));
         assert_eq!(server.architecture(), "arm64");
         assert_eq!(server.location(), Some("fsn1"));
+    }
+
+    #[test]
+    fn server_create_payload_uses_provider_id_shapes() {
+        let encoded = serde_json::to_value(create_server_payload()).expect("serialize payload");
+        assert_eq!(encoded["ssh_keys"], json!([41, 42]));
+        assert_eq!(encoded["firewalls"], json!([{"firewall": 8}]));
+        assert!(encoded["ssh_keys"][0].is_number());
+    }
+
+    #[test]
+    fn resolves_names_and_ids_deterministically_and_deduplicates() {
+        let available = vec![
+            SshKey {
+                id: 41,
+                name: "operator".to_owned(),
+            },
+            SshKey {
+                id: 42,
+                name: "backup".to_owned(),
+            },
+        ];
+        let references = vec![
+            "operator".to_owned(),
+            "42".to_owned(),
+            "operator".to_owned(),
+        ];
+        assert_eq!(
+            resolve_ssh_key_references(&references, &available).expect("resolve SSH keys"),
+            [41, 42]
+        );
+    }
+
+    #[test]
+    fn ambiguous_numeric_name_fails_closed() {
+        let available = vec![
+            SshKey {
+                id: 42,
+                name: "operator".to_owned(),
+            },
+            SshKey {
+                id: 99,
+                name: "42".to_owned(),
+            },
+        ];
+        let error = resolve_ssh_key_references(&["42".to_owned()], &available)
+            .expect_err("ambiguous reference must fail");
+        assert_eq!(error.code, "ssh_key_ambiguous");
+        assert_eq!(error.kind, ErrorKind::Conflict);
+    }
+
+    #[tokio::test]
+    async fn paginates_ssh_keys_and_resolves_provider_ids() {
+        let (base_url, requests, server) = spawn_mock_api(vec![
+            json!({
+                "ssh_keys": [{"id": 41, "name": "operator"}],
+                "meta": {"pagination": {"next_page": 2}}
+            }),
+            json!({
+                "ssh_keys": [{"id": 42, "name": "backup"}],
+                "meta": {"pagination": {"next_page": null}}
+            }),
+        ]);
+        let client = ApiClient::with_base_url(base_url);
+        let resolved = client
+            .resolve_ssh_key_ids("mock-token", &["operator".to_owned(), "42".to_owned()])
+            .await
+            .expect("resolve paginated SSH keys");
+        assert_eq!(resolved, [41, 42]);
+
+        let first = requests
+            .recv_timeout(Duration::from_secs(1))
+            .expect("first SSH key request");
+        let second = requests
+            .recv_timeout(Duration::from_secs(1))
+            .expect("second SSH key request");
+        assert!(
+            first
+                .head
+                .starts_with("GET /v1/ssh_keys?per_page=50&page=1 HTTP/1.1")
+        );
+        assert!(
+            second
+                .head
+                .starts_with("GET /v1/ssh_keys?per_page=50&page=2 HTTP/1.1")
+        );
+        assert!(
+            first
+                .head
+                .to_ascii_lowercase()
+                .contains("authorization: bearer mock-token")
+        );
+        assert!(first.body.is_empty());
+        assert_eq!(server.join().expect("join mock API"), 2);
+    }
+
+    #[tokio::test]
+    async fn create_server_posts_nested_firewall_and_numeric_key_ids() {
+        let (base_url, requests, server) = spawn_mock_api(vec![json!({
+            "server": {
+                "id": 7,
+                "name": "lr-schema-test",
+                "status": "initializing",
+                "labels": {"lightrail-managed": "true"},
+                "public_net": {"ipv4": {"ip": "203.0.113.7"}},
+                "server_type": {"name": "cx23", "architecture": "x86"},
+                "image": {"name": "ubuntu-24.04"},
+                "datacenter": {"location": {"name": "nbg1"}}
+            },
+            "action": {"id": 9, "status": "running", "error": null}
+        })]);
+        let client = ApiClient::with_base_url(base_url);
+        client
+            .create_server("mock-token", &create_server_payload())
+            .await
+            .expect("create server response");
+
+        let request = requests
+            .recv_timeout(Duration::from_secs(1))
+            .expect("server create request");
+        assert!(request.head.starts_with("POST /v1/servers HTTP/1.1"));
+        let body: serde_json::Value =
+            serde_json::from_slice(&request.body).expect("server create request JSON");
+        assert_eq!(body["ssh_keys"], json!([41, 42]));
+        assert_eq!(body["firewalls"], json!([{"firewall": 8}]));
+        assert_eq!(server.join().expect("join mock API"), 1);
+    }
+
+    #[tokio::test]
+    async fn missing_key_diagnostic_never_contains_provider_token() {
+        let (base_url, _requests, server) = spawn_mock_api(vec![json!({
+            "ssh_keys": [],
+            "meta": {"pagination": {"next_page": null}}
+        })]);
+        let client = ApiClient::with_base_url(base_url);
+        let token = "provider-secret-never-diagnose";
+        let error = client
+            .resolve_ssh_key_ids(token, &["missing-key".to_owned()])
+            .await
+            .expect_err("missing key must fail");
+        assert_eq!(error.code, "ssh_key_not_found");
+        assert!(!error.message.contains(token));
+        assert!(!error.details.to_string().contains(token));
+        assert_eq!(server.join().expect("join mock API"), 1);
     }
 
     #[test]

@@ -1,0 +1,16 @@
+name: lightrail-single-example
+
+services:
+  web:
+    build:
+      context: .
+    expose:
+      - "8080"
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - wget -q -O /dev/null "http://$$(hostname):8080/health"
+      interval: 5s
+      timeout: 2s
+      retries: 12
+      start_period: 2s

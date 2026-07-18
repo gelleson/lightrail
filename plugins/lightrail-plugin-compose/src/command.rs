@@ -332,6 +332,8 @@ fn ssh_arguments(target: &TargetState, remote_command: &str) -> Vec<OsString> {
         OsString::from(format!("ConnectTimeout={SSH_CONNECT_TIMEOUT_SECONDS}")),
         OsString::from("-o"),
         OsString::from("StrictHostKeyChecking=accept-new"),
+        OsString::from("-o"),
+        OsString::from("GlobalKnownHostsFile=/dev/null"),
         OsString::from("-p"),
         OsString::from(target.port.to_string()),
     ];
@@ -343,12 +345,21 @@ fn ssh_arguments(target: &TargetState, remote_command: &str) -> Vec<OsString> {
         arguments.push(OsString::from("-o"));
         arguments.push(OsString::from(format!(
             "UserKnownHostsFile={}",
-            known_hosts_file.display()
+            openssh_quoted_path(known_hosts_file)
         )));
     }
     arguments.push(OsString::from(target.destination()));
     arguments.push(OsString::from(remote_command));
     arguments
+}
+
+fn openssh_quoted_path(path: &Path) -> String {
+    let escaped = path
+        .to_string_lossy()
+        .replace('%', "%%")
+        .replace('\\', "\\\\")
+        .replace('"', "\\\"");
+    format!("\"{escaped}\"")
 }
 
 fn docker_aware_arguments(target: &TargetState, arguments: Vec<String>) -> Vec<String> {
@@ -447,7 +458,12 @@ mod tests {
         assert!(
             arguments
                 .iter()
-                .any(|argument| { argument == "UserKnownHostsFile=/home/me/.ssh/known_hosts" })
+                .any(|argument| { argument == "UserKnownHostsFile=\"/home/me/.ssh/known_hosts\"" })
+        );
+        assert!(
+            arguments
+                .iter()
+                .any(|argument| argument == "GlobalKnownHostsFile=/dev/null")
         );
         assert!(
             arguments
@@ -474,6 +490,14 @@ mod tests {
         );
         assert!(
             validate_resolved_addresses("remote.example", [IpAddr::from([8, 8, 8, 8])]).is_ok()
+        );
+    }
+
+    #[test]
+    fn ssh_option_paths_are_quoted_without_creating_new_options() {
+        assert_eq!(
+            openssh_quoted_path(Path::new("/tmp/My Project=a%b\\c\"d")),
+            "\"/tmp/My Project=a%%b\\\\c\\\"d\""
         );
     }
 

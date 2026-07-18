@@ -1080,7 +1080,7 @@ fn config_schema() -> Value {
             },
             "ingress_image": {
                 "type": "string",
-                "default": "traefik:v3.3"
+                "default": "traefik:v3.7.8"
             },
             "ingress_network": {
                 "type": "string",
