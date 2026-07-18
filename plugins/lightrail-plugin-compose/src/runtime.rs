@@ -1,3 +1,11 @@
+//! Remote Compose lifecycle, from local Buildx output through HTTPS readiness.
+//!
+//! The workflow is ordered as build/transfer, generated deployment upload,
+//! shared Traefik reconciliation, rollback metadata, remote inspection and
+//! discovery, ownership-scoped destruction, logs, then endpoint readiness.
+//! Keep source Compose files immutable and keep SSH/provider concerns behind
+//! the command and target contracts.
+
 use std::{
     collections::{BTreeMap, BTreeSet},
     ffi::OsString,

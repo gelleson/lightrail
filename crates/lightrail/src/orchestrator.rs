@@ -1,3 +1,10 @@
+//! Provider-independent lifecycle engine for user-facing environment commands.
+//!
+//! Read this file by workflow: `up`, read-only queries, `down`, and logs come
+//! first; shared preparation, secrets, inspection, locking, and rollback
+//! follow. Stable output DTOs, aggregation, and rendering live in `view` so
+//! lifecycle control flow remains visible here.
+
 use std::{
     collections::{BTreeMap, BTreeSet},
     future::Future,
@@ -9,15 +16,19 @@ use dialoguer::{Confirm, Password};
 use lightrail_core::Capability as CoreCapability;
 use lightrail_plugin_protocol::{
     ActionJournalEntry, ApplyRequest, ApplyResult, CancelRequest, Capability, ClientError,
-    ClientEvent, DestroyRequest, DestroyResult, Endpoint, InspectRequest, InspectResult,
-    LockAcquireRequest, LockAcquireResult, LockReleaseRequest, LockScope, LogsRequest,
-    OperationContext, PlanRequest, PlanResult, PluginEvent, PluginManifest, ResourceStatus,
-    SecretValue, ValidateRequest,
+    ClientEvent, DestroyRequest, DestroyResult, InspectRequest, InspectResult, LockAcquireRequest,
+    LockAcquireResult, LockReleaseRequest, LockScope, LogsRequest, OperationContext, PlanRequest,
+    PlanResult, PluginEvent, PluginManifest, ResourceStatus, SecretValue, ValidateRequest,
 };
 use secrecy::{ExposeSecret, SecretString};
-use serde::Serialize;
 use serde_json::{Value, json};
 use uuid::Uuid;
+
+mod view;
+
+pub use view::{
+    ActionView, EnvironmentSummaryView, EnvironmentView, PlanView, PluginPlanView, PluginStatusView,
+};
 
 use crate::{
     compose::ComposeInspector,
@@ -27,7 +38,12 @@ use crate::{
     plugin_host::{PluginResolver, PluginSession},
     process::TokioCommandRunner,
     project::LoadedProject,
-    secrets::{KeyringBackend, SecretStore},
+    secrets::{KeyringBackend, SecretBackend, SecretStore},
+};
+
+use self::view::{
+    collect_endpoints, collect_environment_summaries, combined_status, print_environment,
+    print_log_records, print_plan, print_urls,
 };
 
 const APPLY_ORDER: [CoreCapability; 6] = [
@@ -81,66 +97,33 @@ pub struct LogOptions {
     pub output: OutputFormat,
 }
 
-#[derive(Clone, Debug, Serialize)]
-pub struct PlanView {
-    pub environment_id: String,
-    pub branch: String,
-    pub profile: String,
-    pub operation: &'static str,
-    pub has_changes: bool,
-    pub plugins: Vec<PluginPlanView>,
-}
-
-#[derive(Clone, Debug, Serialize)]
-pub struct PluginPlanView {
-    pub capability: String,
-    pub plugin: String,
-    pub plan_id: String,
-    pub has_changes: bool,
-    pub actions: Vec<ActionView>,
-}
-
-#[derive(Clone, Debug, Serialize)]
-pub struct ActionView {
-    pub id: String,
-    pub summary: String,
-    pub destructive: bool,
-}
-
-#[derive(Clone, Debug, Serialize)]
-pub struct EnvironmentView {
-    pub environment_id: String,
-    pub branch: String,
-    pub profile: String,
-    pub status: ResourceStatus,
-    pub endpoints: Vec<Endpoint>,
-    pub plugins: Vec<PluginStatusView>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub environments: Vec<EnvironmentSummaryView>,
-}
-
-#[derive(Clone, Debug, Serialize)]
-pub struct EnvironmentSummaryView {
-    pub environment_id: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub branch: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub profile: Option<String>,
-    pub status: ResourceStatus,
-    #[serde(default)]
-    pub endpoints: Vec<Endpoint>,
-}
-
-#[derive(Clone, Debug, Serialize)]
-pub struct PluginStatusView {
-    pub capability: String,
-    pub plugin: String,
-    pub status: ResourceStatus,
-    pub state: Value,
-}
-
 struct PluginFleet {
     sessions: BTreeMap<String, PluginSession>,
+    secret_cache: OperationSecretCache,
+}
+
+#[derive(Default)]
+struct OperationSecretCache {
+    values: tokio::sync::Mutex<BTreeMap<String, SecretString>>,
+}
+
+impl OperationSecretCache {
+    async fn resolve<B: SecretBackend>(
+        &self,
+        store: &SecretStore<B>,
+        name: &str,
+    ) -> Result<SecretString, CliError> {
+        // Keep the guard through the first lookup and possible prompt so two
+        // concurrent capability contexts cannot ask for the same secret twice.
+        let mut values = self.values.lock().await;
+        if let Some(value) = values.get(name) {
+            return Ok(value.clone());
+        }
+
+        let value = resolve_uncached_secret(store, name).await?;
+        values.insert(name.to_owned(), value.clone());
+        Ok(value)
+    }
 }
 
 impl PluginFleet {
@@ -175,7 +158,10 @@ impl PluginFleet {
                 .expect("every selected plugin was started");
             session.require_capability(&protocol_capability(*capability))?;
         }
-        Ok(Self { sessions })
+        Ok(Self {
+            sessions,
+            secret_cache: OperationSecretCache::default(),
+        })
     }
 
     fn session(&self, identifier: &str) -> Result<&PluginSession, CliError> {
@@ -254,6 +240,9 @@ async fn up_with_fleet(
             prepare_up_from_target(project, fleet, operation_id, &base_desired, target).await?;
         let view = plan_view(project, "up", &prepared);
         print_plan(&view, options.output)?;
+        if options.output == OutputFormat::Human {
+            output::line("Dry run complete; no changes were made.")?;
+        }
         return Ok(EnvironmentView {
             environment_id: project.identity.id().as_str().to_owned(),
             branch: project.git.branch().to_owned(),
@@ -400,6 +389,7 @@ async fn up_with_fleet(
                     &target_state,
                     lock.as_ref(),
                     options.keep_failed,
+                    options.output,
                     &message,
                 )
                 .await?;
@@ -416,6 +406,7 @@ async fn up_with_fleet(
                     &target_state,
                     lock.as_ref(),
                     options.keep_failed,
+                    options.output,
                     &message,
                 )
                 .await?;
@@ -426,13 +417,9 @@ async fn up_with_fleet(
     .await;
 
     let release_result = release_lock(fleet, lock).await;
-    match (result, release_result) {
-        (Ok(environment), Ok(())) => {
-            print_environment(&environment, options.output)?;
-            Ok(environment)
-        }
-        (Ok(_), Err(error)) | (Err(error), _) => Err(error),
-    }
+    let environment = finish_with_lock_release(result, release_result)?;
+    print_environment(&environment, options.output)?;
+    Ok(environment)
 }
 
 async fn apply_with_progress(
@@ -591,6 +578,7 @@ pub async fn inspect_target(project: LoadedProject) -> Result<InspectResult, Cli
         let session = fleet.session(plugin_id)?;
         let context = operation_context(
             &project,
+            &fleet,
             session,
             CoreCapability::Target,
             &operation_id,
@@ -660,13 +648,16 @@ async fn down_with_fleet(
     let view = plan_view(project, "down", &prepared);
     if options.dry_run {
         print_plan(&view, options.output)?;
+        if options.output == OutputFormat::Human {
+            output::line("Dry run complete; no changes were made.")?;
+        }
         return Ok(());
     }
     if options.output == OutputFormat::Human {
         print_plan(&view, options.output)?;
     }
     if !view.has_changes {
-        print_destroyed(options.output, true)?;
+        print_destroyed(project, options, true)?;
         return Ok(());
     }
     if !options.yes {
@@ -677,11 +668,15 @@ async fn down_with_fleet(
         }
         let subject = if options.all {
             format!(
-                "Destroy every environment for project `{}`?",
-                project.config.project.slug
+                "Destroy every project environment visible through profile `{}`'s target?",
+                project.profile_name
             )
         } else {
-            format!("Destroy environment `{}`?", project.identity.id().as_str())
+            format!(
+                "Destroy branch `{}` with profile `{}`?",
+                project.git.branch(),
+                project.profile_name
+            )
         };
         if !Confirm::new()
             .with_prompt(subject)
@@ -689,7 +684,8 @@ async fn down_with_fleet(
             .interact()
             .map_err(|error| CliError::Operation(format!("confirmation failed: {error}")))?
         {
-            return Err(CliError::Usage("destruction cancelled".into()));
+            print_cancelled(options.output)?;
+            return Ok(());
         }
     }
 
@@ -708,9 +704,10 @@ async fn down_with_fleet(
         let prepared =
             prepare_down_capabilities(project, fleet, operation_id, &desired, options).await?;
         if plan_contract(&prepared) != displayed_contract {
-            return Err(CliError::Operation(
-                "owned resources changed while waiting for the mutation lock; rerun `lightrail down` to review the new plan".into(),
-            ));
+            let retry = down_retry_command(&project.profile_name, options, false);
+            return Err(CliError::Operation(format!(
+                "owned resources changed while waiting for the mutation lock; rerun `{retry}` to review the new plan"
+            )));
         }
         let mut journal =
             OperationJournal::new(project.identity.id().as_str(), OperationKind::Down);
@@ -778,8 +775,9 @@ async fn down_with_fleet(
                 .await?;
             Ok(())
         } else {
+            let retry = down_retry_command(&project.profile_name, options, true);
             let message = format!(
-                "destruction incomplete; rerun `lightrail down --yes`: {}",
+                "destruction incomplete; rerun `{retry}`: {}",
                 failures.join("; ")
             );
             journal.status = OperationStatus::Failed;
@@ -793,13 +791,9 @@ async fn down_with_fleet(
     .await;
 
     let release = release_lock(fleet, lock).await;
-    match (result, release) {
-        (Ok(()), Ok(())) => {
-            print_destroyed(options.output, false)?;
-            Ok(())
-        }
-        (Ok(()), Err(error)) | (Err(error), _) => Err(error),
-    }
+    finish_with_lock_release(result, release)?;
+    print_destroyed(project, options, false)?;
+    Ok(())
 }
 
 struct DestroyAttempt {
@@ -936,20 +930,85 @@ async fn prepare_down_capabilities(
     Ok(prepared)
 }
 
-fn print_destroyed(format: OutputFormat, already_absent: bool) -> Result<(), CliError> {
-    match format {
+fn print_destroyed(
+    project: &LoadedProject,
+    options: &DownOptions,
+    already_absent: bool,
+) -> Result<(), CliError> {
+    match options.output {
         OutputFormat::Json => output::json(&json!({
             "destroyed": true,
             "already_absent": already_absent,
         })),
-        OutputFormat::Plain | OutputFormat::Human => {
+        OutputFormat::Plain => {
             if already_absent {
                 output::line("environment is already absent")
             } else {
                 output::line("environment destroyed")
             }
         }
+        OutputFormat::Human if options.all && already_absent => output::line(format!(
+            "Nothing to do: profile `{}`'s target has no environments for project `{}`.",
+            project.profile_name, project.config.project.slug
+        )),
+        OutputFormat::Human if options.all => output::line(format!(
+            "Destroyed all project environments visible through profile `{}`'s target.",
+            project.profile_name
+        )),
+        OutputFormat::Human if already_absent => output::line(format!(
+            "Nothing to do: {} / {} is already absent.",
+            project.git.branch(),
+            project.profile_name
+        )),
+        OutputFormat::Human => output::line(format!(
+            "Destroyed {} / {}.",
+            project.git.branch(),
+            project.profile_name
+        )),
     }
+}
+
+fn print_cancelled(format: OutputFormat) -> Result<(), CliError> {
+    match format {
+        OutputFormat::Json => output::json(&json!({
+            "destroyed": false,
+            "cancelled": true,
+        })),
+        OutputFormat::Plain => output::line("cancelled"),
+        OutputFormat::Human => output::line("Cancelled; no resources were changed."),
+    }
+}
+
+fn down_retry_command(profile: &str, options: &DownOptions, assume_yes: bool) -> String {
+    let mut command = format!(
+        "lightrail --profile={} down",
+        shell_quote_command_value(profile)
+    );
+    if options.all {
+        command.push_str(" --all");
+    }
+    if options.force {
+        command.push_str(" --force");
+    }
+    command.push_str(&format!(
+        " --lock-timeout {}s",
+        options.lock_timeout.as_secs()
+    ));
+    if assume_yes {
+        command.push_str(" --yes");
+    }
+    command
+}
+
+fn shell_quote_command_value(value: &str) -> String {
+    if !value.is_empty()
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'))
+    {
+        return value.to_owned();
+    }
+    format!("'{}'", value.replace('\'', "'\"'\"'"))
 }
 
 pub async fn logs(project: LoadedProject, options: LogOptions) -> Result<(), CliError> {
@@ -974,6 +1033,7 @@ async fn logs_with_fleet(
     let target_session = fleet.session(target_id)?;
     let target_context = operation_context(
         project,
+        fleet,
         target_session,
         CoreCapability::Target,
         operation_id,
@@ -993,6 +1053,7 @@ async fn logs_with_fleet(
     let runtime = fleet.session(runtime_id)?;
     let context = operation_context(
         project,
+        fleet,
         runtime,
         CoreCapability::Runtime,
         operation_id,
@@ -1058,6 +1119,7 @@ async fn prepare_capability(
     let session = fleet.session(&plugin_id)?;
     let context = operation_context(
         project,
+        fleet,
         session,
         capability,
         operation_id,
@@ -1112,6 +1174,7 @@ async fn prepare_capability(
 
 async fn operation_context(
     project: &LoadedProject,
+    fleet: &PluginFleet,
     session: &PluginSession,
     capability: CoreCapability,
     operation_id: &str,
@@ -1119,7 +1182,14 @@ async fn operation_context(
     all: bool,
     target_state: &Value,
 ) -> Result<OperationContext, CliError> {
-    let secrets = resolve_plugin_secrets(project, &session.manifest, capability, operation).await?;
+    let secrets = resolve_plugin_secrets(
+        project,
+        &fleet.secret_cache,
+        &session.manifest,
+        capability,
+        operation,
+    )
+    .await?;
     Ok(OperationContext {
         operation_id: operation_id.to_owned(),
         environment_id: project.identity.id().as_str().to_owned(),
@@ -1141,6 +1211,7 @@ async fn operation_context(
 
 async fn resolve_plugin_secrets(
     project: &LoadedProject,
+    cache: &OperationSecretCache,
     manifest: &PluginManifest,
     capability: CoreCapability,
     operation: &str,
@@ -1179,7 +1250,7 @@ async fn resolve_plugin_secrets(
     );
     let mut resolved = BTreeMap::new();
     for (name, required) in requested {
-        match resolve_secret(&store, &name).await {
+        match cache.resolve(&store, &name).await {
             Ok(value) => {
                 resolved.insert(name, SecretValue::new(value.expose_secret().to_owned()));
             }
@@ -1190,8 +1261,8 @@ async fn resolve_plugin_secrets(
     Ok(resolved)
 }
 
-async fn resolve_secret(
-    store: &SecretStore<KeyringBackend>,
+async fn resolve_uncached_secret<B: SecretBackend>(
+    store: &SecretStore<B>,
     name: &str,
 ) -> Result<SecretString, CliError> {
     match store.resolve(name).await {
@@ -1199,7 +1270,7 @@ async fn resolve_secret(
         Err(error @ CliError::SecretUnavailable { .. }) if !io::stdin().is_terminal() => Err(error),
         Err(CliError::SecretUnavailable { .. }) => {
             let value = Password::new()
-                .with_prompt(format!("Secret {name}"))
+                .with_prompt(format!("Secret {name} (used for this command only)"))
                 .interact()
                 .map_err(|prompt| {
                     CliError::Operation(format!("could not read secret `{name}`: {prompt}"))
@@ -1295,6 +1366,7 @@ async fn inspect_environment(
     let target_session = fleet.session(target_id)?;
     let target_context = operation_context(
         project,
+        fleet,
         target_session,
         CoreCapability::Target,
         operation_id,
@@ -1340,6 +1412,7 @@ async fn inspect_environment(
             let session = fleet.session(plugin_id)?;
             let context = operation_context(
                 project,
+                fleet,
                 session,
                 capability,
                 operation_id,
@@ -1487,7 +1560,7 @@ async fn acquire_lock(
     };
     if !result.acquired {
         return Err(CliError::Operation(format!(
-            "environment lock is held{}",
+            "environment lock is held{}; retry later or increase `--lock-timeout`",
             result
                 .holder
                 .as_deref()
@@ -1635,6 +1708,19 @@ async fn release_lock(fleet: &PluginFleet, lock: Option<MutationLock>) -> Result
     }
 }
 
+fn finish_with_lock_release<T>(
+    operation: Result<T, CliError>,
+    release: Result<(), CliError>,
+) -> Result<T, CliError> {
+    match (operation, release) {
+        (Ok(value), Ok(())) => Ok(value),
+        (Ok(_), Err(error)) | (Err(error), Ok(())) => Err(error),
+        (Err(operation), Err(release)) => Err(CliError::Operation(format!(
+            "{operation}; additionally failed to release the mutation lock: {release}"
+        ))),
+    }
+}
+
 async fn rollback_after_failure(
     project: &LoadedProject,
     fleet: &PluginFleet,
@@ -1644,6 +1730,7 @@ async fn rollback_after_failure(
     target_state: &Value,
     lock: Option<&MutationLock>,
     keep_failed: bool,
+    format: OutputFormat,
     error: &str,
 ) -> Result<(), CliError> {
     journal.error = Some(error.to_owned());
@@ -1652,6 +1739,9 @@ async fn rollback_after_failure(
         journal
             .save(&project.paths.local.join("operations"))
             .await?;
+        if format == OutputFormat::Human {
+            eprintln!("warning: failed resources were preserved because --keep-failed was used");
+        }
         return Ok(());
     }
 
@@ -1723,6 +1813,9 @@ async fn rollback_after_failure(
     journal
         .save(&project.paths.local.join("operations"))
         .await?;
+    if format == OutputFormat::Human {
+        eprintln!("info: rollback completed; failed changes were cleaned up");
+    }
     Ok(())
 }
 
@@ -1894,360 +1987,10 @@ fn mark_plugin_actions_completed(
     }
 }
 
-fn combined_status(statuses: impl Iterator<Item = ResourceStatus>) -> ResourceStatus {
-    let mut saw_any = false;
-    let mut worst = ResourceStatus::Ready;
-    for status in statuses {
-        saw_any = true;
-        if status_rank(status) > status_rank(worst) {
-            worst = status;
-        }
-    }
-    if saw_any {
-        worst
-    } else {
-        ResourceStatus::Absent
-    }
-}
-
-const fn status_rank(status: ResourceStatus) -> u8 {
-    match status {
-        ResourceStatus::Ready => 0,
-        ResourceStatus::Absent => 1,
-        ResourceStatus::Pending => 2,
-        ResourceStatus::Destroying => 3,
-        ResourceStatus::Degraded => 4,
-        ResourceStatus::Unknown => 5,
-    }
-}
-
-fn collect_endpoints<'a>(inspections: impl Iterator<Item = &'a InspectResult>) -> Vec<Endpoint> {
-    let mut endpoints = BTreeMap::new();
-    for endpoint in inspections.flat_map(|inspection| &inspection.endpoints) {
-        endpoints.insert(endpoint.url.clone(), endpoint.clone());
-    }
-    endpoints.into_values().collect()
-}
-
-fn collect_environment_summaries<'a>(
-    inspections: impl Iterator<Item = &'a InspectResult>,
-) -> Vec<EnvironmentSummaryView> {
-    let inspections = inspections.collect::<Vec<_>>();
-    let mut environments = BTreeMap::<String, EnvironmentSummaryView>::new();
-    for inspection in &inspections {
-        let Some(items) = inspection
-            .state
-            .get("environments")
-            .and_then(Value::as_array)
-        else {
-            continue;
-        };
-        for item in items {
-            let (environment_id, branch, profile, status, endpoints) =
-                if let Some(environment_id) = item.as_str() {
-                    (
-                        environment_id.to_owned(),
-                        None,
-                        None,
-                        ResourceStatus::Unknown,
-                        Vec::new(),
-                    )
-                } else {
-                    let Some(environment_id) = item
-                        .get("environment_id")
-                        .or_else(|| item.get("id"))
-                        .and_then(Value::as_str)
-                    else {
-                        continue;
-                    };
-                    let status = item
-                        .get("status")
-                        .cloned()
-                        .and_then(|value| serde_json::from_value(value).ok())
-                        .unwrap_or(inspection.status);
-                    let endpoints = item
-                        .get("endpoints")
-                        .cloned()
-                        .and_then(|value| serde_json::from_value(value).ok())
-                        .unwrap_or_default();
-                    (
-                        environment_id.to_owned(),
-                        item.get("branch")
-                            .and_then(Value::as_str)
-                            .map(ToOwned::to_owned),
-                        item.get("profile")
-                            .and_then(Value::as_str)
-                            .map(ToOwned::to_owned),
-                        status,
-                        endpoints,
-                    )
-                };
-            let candidate = EnvironmentSummaryView {
-                environment_id: environment_id.clone(),
-                branch,
-                profile,
-                status,
-                endpoints,
-            };
-            environments
-                .entry(environment_id)
-                .and_modify(|existing| merge_environment_summary(existing, &candidate))
-                .or_insert(candidate);
-        }
-    }
-    // Machine-isolated providers may be able to rediscover servers even when
-    // an individual runtime is not reachable. Preserve that visibility
-    // without claiming branch names or URLs that were not observed.
-    if environments.is_empty() {
-        for inspection in inspections {
-            let Some(targets) = inspection.state.get("targets").and_then(Value::as_array) else {
-                continue;
-            };
-            for target in targets {
-                let environment_id = target
-                    .get("environment_id")
-                    .and_then(Value::as_str)
-                    .or_else(|| target.get("environment_label").and_then(Value::as_str))
-                    .map(ToOwned::to_owned)
-                    .or_else(|| {
-                        target
-                            .get("server_id")
-                            .and_then(Value::as_u64)
-                            .map(|id| format!("hetzner-server-{id}"))
-                    });
-                let Some(environment_id) = environment_id else {
-                    continue;
-                };
-                let status = match target.get("server_status").and_then(Value::as_str) {
-                    Some("running") => ResourceStatus::Ready,
-                    Some("initializing" | "starting" | "migrating" | "rebuilding") => {
-                        ResourceStatus::Pending
-                    }
-                    Some(_) => ResourceStatus::Degraded,
-                    None => inspection.status,
-                };
-                environments.insert(
-                    environment_id.clone(),
-                    EnvironmentSummaryView {
-                        environment_id,
-                        branch: None,
-                        profile: None,
-                        status,
-                        endpoints: Vec::new(),
-                    },
-                );
-            }
-        }
-    }
-    environments.into_values().collect()
-}
-
-fn merge_environment_summary(
-    existing: &mut EnvironmentSummaryView,
-    candidate: &EnvironmentSummaryView,
-) {
-    if existing.branch.is_none() {
-        existing.branch.clone_from(&candidate.branch);
-    }
-    if existing.profile.is_none() {
-        existing.profile.clone_from(&candidate.profile);
-    }
-    if existing.status == ResourceStatus::Unknown
-        || (candidate.status != ResourceStatus::Unknown
-            && status_rank(candidate.status) > status_rank(existing.status))
-    {
-        existing.status = candidate.status;
-    }
-    let mut endpoints = existing
-        .endpoints
-        .iter()
-        .cloned()
-        .map(|endpoint| (endpoint.url.clone(), endpoint))
-        .collect::<BTreeMap<_, _>>();
-    for endpoint in &candidate.endpoints {
-        endpoints.insert(endpoint.url.clone(), endpoint.clone());
-    }
-    existing.endpoints = endpoints.into_values().collect();
-}
-
-fn print_plan(plan: &PlanView, format: OutputFormat) -> Result<(), CliError> {
-    match format {
-        OutputFormat::Json => output::json(plan),
-        OutputFormat::Plain | OutputFormat::Human => {
-            output::line(format!(
-                "{} {} ({}/{})",
-                plan.operation, plan.environment_id, plan.branch, plan.profile
-            ))?;
-            for plugin in &plan.plugins {
-                if plugin.actions.is_empty() {
-                    if format == OutputFormat::Human {
-                        output::line(format!(
-                            "  {:<9} {}: no changes",
-                            plugin.capability, plugin.plugin
-                        ))?;
-                    }
-                    continue;
-                }
-                for action in &plugin.actions {
-                    output::line(format!(
-                        "  {:<9} {}{}",
-                        plugin.capability,
-                        action.summary,
-                        if action.destructive {
-                            " [destructive]"
-                        } else {
-                            ""
-                        }
-                    ))?;
-                }
-            }
-            Ok(())
-        }
-    }
-}
-
-fn print_environment(environment: &EnvironmentView, format: OutputFormat) -> Result<(), CliError> {
-    match format {
-        OutputFormat::Json => output::json(environment),
-        OutputFormat::Plain => {
-            if !environment.environments.is_empty() {
-                for discovered in &environment.environments {
-                    output::line(format!(
-                        "{}\t{}",
-                        discovered.environment_id,
-                        format!("{:?}", discovered.status).to_ascii_lowercase()
-                    ))?;
-                    for endpoint in &discovered.endpoints {
-                        output::line(&endpoint.url)?;
-                    }
-                }
-                return Ok(());
-            }
-            output::line(format!("{:?}", environment.status).to_ascii_lowercase())?;
-            for endpoint in &environment.endpoints {
-                output::line(&endpoint.url)?;
-            }
-            Ok(())
-        }
-        OutputFormat::Human => {
-            if !environment.environments.is_empty() {
-                for discovered in &environment.environments {
-                    output::line(format!(
-                        "{}  {:?}  branch={} profile={}",
-                        discovered.environment_id,
-                        discovered.status,
-                        discovered.branch.as_deref().unwrap_or("unknown"),
-                        discovered.profile.as_deref().unwrap_or("unknown")
-                    ))?;
-                    for endpoint in &discovered.endpoints {
-                        output::line(format!("{:<16} {}", endpoint.app, endpoint.url))?;
-                    }
-                }
-                return Ok(());
-            }
-            output::line(format!(
-                "{}  {:?}  branch={} profile={}",
-                environment.environment_id,
-                environment.status,
-                environment.branch,
-                environment.profile
-            ))?;
-            for endpoint in &environment.endpoints {
-                output::line(format!("{:<16} {}", endpoint.app, endpoint.url))?;
-            }
-            Ok(())
-        }
-    }
-}
-
-fn print_urls(environment: &EnvironmentView, format: OutputFormat) -> Result<(), CliError> {
-    let aggregate_urls = environment
-        .environments
-        .iter()
-        .flat_map(|environment| {
-            environment.endpoints.iter().map(move |endpoint| {
-                json!({
-                    "environment_id": environment.environment_id,
-                    "branch": environment.branch,
-                    "profile": environment.profile,
-                    "app": endpoint.app,
-                    "url": endpoint.url,
-                })
-            })
-        })
-        .collect::<Vec<_>>();
-    if environment.endpoints.is_empty() && aggregate_urls.is_empty() {
-        return Err(CliError::Operation(
-            "environment has no discoverable public URLs".into(),
-        ));
-    }
-    match format {
-        OutputFormat::Json if aggregate_urls.is_empty() => output::json(&environment.endpoints),
-        OutputFormat::Json => output::json(&aggregate_urls),
-        OutputFormat::Plain => {
-            if aggregate_urls.is_empty() {
-                for endpoint in &environment.endpoints {
-                    output::line(&endpoint.url)?;
-                }
-            } else {
-                for url in &aggregate_urls {
-                    if let Some(url) = url.get("url").and_then(Value::as_str) {
-                        output::line(url)?;
-                    }
-                }
-            }
-            Ok(())
-        }
-        OutputFormat::Human => {
-            if aggregate_urls.is_empty() {
-                for endpoint in &environment.endpoints {
-                    output::line(format!("{:<16} {}", endpoint.app, endpoint.url))?;
-                }
-            } else {
-                for url in &aggregate_urls {
-                    let branch = url
-                        .get("branch")
-                        .and_then(Value::as_str)
-                        .unwrap_or("unknown");
-                    let app = url.get("app").and_then(Value::as_str).unwrap_or("app");
-                    let endpoint = url.get("url").and_then(Value::as_str).unwrap_or_default();
-                    output::line(format!("{branch}/{app:<16} {endpoint}"))?;
-                }
-            }
-            Ok(())
-        }
-    }
-}
-
-fn print_log_records(
-    records: &[lightrail_plugin_protocol::LogRecord],
-    format: OutputFormat,
-) -> Result<(), CliError> {
-    match format {
-        OutputFormat::Json => {
-            for record in records {
-                output::json(record)?;
-            }
-            Ok(())
-        }
-        OutputFormat::Plain => {
-            for record in records {
-                output::line(&record.line)?;
-            }
-            Ok(())
-        }
-        OutputFormat::Human => {
-            for record in records {
-                output::line(format!("{:<16} {}", record.service, record.line))?;
-            }
-            Ok(())
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use lightrail_plugin_protocol::Endpoint;
 
     #[test]
     fn combines_status_using_failure_severity() {
@@ -2269,6 +2012,52 @@ mod tests {
         assert_eq!(
             names,
             BTreeSet::from(["database-url".into(), "hetzner-token".into()])
+        );
+    }
+
+    #[tokio::test]
+    async fn operation_secret_cache_reuses_a_resolved_value_without_persisting_it() {
+        let temp = tempfile::tempdir().expect("temporary directory");
+        let backend = crate::secrets::MemoryBackend::default();
+        let store = SecretStore::new(backend, "project", temp.path());
+        store
+            .set(
+                "hetzner-token",
+                SecretString::from("provider-token".to_owned()),
+            )
+            .await
+            .expect("seed backing store");
+        let cache = OperationSecretCache::default();
+
+        let first = cache
+            .resolve(&store, "hetzner-token")
+            .await
+            .expect("initial resolution");
+        store
+            .delete("hetzner-token")
+            .await
+            .expect("remove persisted value");
+        let repeated = cache
+            .resolve(&store, "hetzner-token")
+            .await
+            .expect("cached resolution");
+
+        assert_eq!(first.expose_secret(), "provider-token");
+        assert_eq!(repeated.expose_secret(), "provider-token");
+        assert!(
+            matches!(
+                store.resolve("hetzner-token").await,
+                Err(CliError::SecretUnavailable { .. })
+            ),
+            "the operation cache must not write a value back to the secret store"
+        );
+        assert!(
+            OperationSecretCache::default()
+                .values
+                .lock()
+                .await
+                .is_empty(),
+            "a separate command cache must start empty"
         );
     }
 
@@ -2305,6 +2094,43 @@ mod tests {
                     .iter()
                     .position(|capability| *capability == CoreCapability::Runtime)
         );
+    }
+
+    #[test]
+    fn down_retry_commands_preserve_scope_and_quote_profile_names() {
+        let options = DownOptions {
+            all: true,
+            dry_run: false,
+            yes: false,
+            force: true,
+            lock_timeout: Duration::from_secs(125),
+            output: OutputFormat::Human,
+        };
+
+        assert_eq!(
+            down_retry_command("preview", &options, false),
+            "lightrail --profile=preview down --all --force --lock-timeout 125s"
+        );
+        assert_eq!(
+            down_retry_command("qa's $(touch unsafe)", &options, true),
+            "lightrail --profile='qa'\"'\"'s $(touch unsafe)' down --all --force --lock-timeout 125s --yes"
+        );
+        assert_eq!(
+            down_retry_command("-preview", &options, false),
+            "lightrail --profile=-preview down --all --force --lock-timeout 125s"
+        );
+    }
+
+    #[test]
+    fn a_lock_release_error_does_not_hide_the_operation_error() {
+        let error = finish_with_lock_release::<()>(
+            Err(CliError::Operation("destroy failed".into())),
+            Err(CliError::Operation("unlock failed".into())),
+        )
+        .expect_err("combined failure");
+
+        assert!(error.to_string().contains("destroy failed"));
+        assert!(error.to_string().contains("unlock failed"));
     }
 
     #[test]

@@ -116,8 +116,9 @@ pub fn ensure_healthy(report: &DoctorReport) -> Result<(), CliError> {
             .map(|check| check.name)
             .collect::<Vec<_>>();
         Err(CliError::Operation(format!(
-            "prerequisite checks failed: {}",
-            failed.join(", ")
+            "{} prerequisite check(s) failed: {}; fix the checks above, then rerun `lightrail doctor`",
+            failed.len(),
+            failed.join(", "),
         )))
     }
 }

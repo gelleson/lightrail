@@ -97,6 +97,11 @@ pub async fn doctor(
         }
         OutputFormat::Human => {
             for check in &report.checks {
+                let detail = if check.name == "target" {
+                    check.detail.to_ascii_lowercase()
+                } else {
+                    check.detail.clone()
+                };
                 output::line(format!(
                     "{:<16} {:<6} {}",
                     check.name,
@@ -105,7 +110,7 @@ pub async fn doctor(
                     } else {
                         "failed"
                     },
-                    check.detail
+                    detail
                 ))?;
                 if let Some(remediation) = check.remediation {
                     output::line(format!("  help: {remediation}"))?;
@@ -179,7 +184,14 @@ pub async fn secret(command: SecretCommand, format: OutputFormat) -> Result<(), 
             let names = store.list().await?;
             match format {
                 OutputFormat::Json => output::json(&names),
-                OutputFormat::Human | OutputFormat::Plain => {
+                OutputFormat::Plain => {
+                    for name in names {
+                        output::line(name)?;
+                    }
+                    Ok(())
+                }
+                OutputFormat::Human if names.is_empty() => output::line("No stored secrets."),
+                OutputFormat::Human => {
                     for name in names {
                         output::line(name)?;
                     }
@@ -238,7 +250,11 @@ pub async fn plugin(command: PluginCommand, format: OutputFormat) -> Result<(), 
                     installed: true,
                 });
             }
-            print_plugin_statuses(&statuses, format)
+            if statuses.is_empty() && format == OutputFormat::Human {
+                output::line("No third-party plugins are pinned.")
+            } else {
+                print_plugin_statuses(&statuses, format)
+            }
         }
         PluginCommand::List => {
             let lock = load_lock_or_default(&paths.lock).await?;
@@ -250,7 +266,11 @@ pub async fn plugin(command: PluginCommand, format: OutputFormat) -> Result<(), 
                     installed,
                 });
             }
-            print_plugin_statuses(&statuses, format)
+            if statuses.is_empty() && format == OutputFormat::Human {
+                output::line("No third-party plugins are pinned.")
+            } else {
+                print_plugin_statuses(&statuses, format)
+            }
         }
         PluginCommand::Inspect { id } => {
             let lock = load_lock_or_default(&paths.lock).await?;

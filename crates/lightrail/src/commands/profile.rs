@@ -180,7 +180,7 @@ pub async fn remove(
     }
     if name == config.project.default_profile {
         return Err(CliError::Usage(format!(
-            "cannot remove default profile `{name}`; choose another project.default_profile first"
+            "cannot remove default profile `{name}`; run `lightrail profile default <name>` first"
         )));
     }
     if live_environment_count > 0 {
@@ -190,6 +190,33 @@ pub async fn remove(
     }
 
     config.profiles.remove(name);
+    save(config_path, &config).await?;
+    Ok(ProfileMutation {
+        name: name.to_owned(),
+        config_path: config_path.to_path_buf(),
+    })
+}
+
+/// Changes the profile selected when `--profile` is omitted.
+///
+/// # Errors
+///
+/// Returns an error when `name` does not exist or the configuration cannot be
+/// written atomically.
+pub async fn set_default(config_path: &Path, name: &str) -> Result<ProfileMutation, CliError> {
+    let mut config = load(config_path)?;
+    if !config.profiles.contains_key(name) {
+        return Err(CliError::Config(format!(
+            "profile `{name}` does not exist; available profiles: {}",
+            config
+                .profiles
+                .keys()
+                .cloned()
+                .collect::<Vec<_>>()
+                .join(", ")
+        )));
+    }
+    name.clone_into(&mut config.project.default_profile);
     save(config_path, &config).await?;
     Ok(ProfileMutation {
         name: name.to_owned(),
@@ -346,5 +373,20 @@ mod tests {
         let config = load(&path).expect("load");
         assert!(!config.profiles.contains_key("staging"));
         assert!(config.profile("preview").is_some());
+    }
+
+    #[tokio::test]
+    async fn default_selects_an_existing_profile() {
+        let (_temp, path) = fixture().await;
+
+        set_default(&path, "staging").await.expect("set default");
+        let config = load(&path).expect("load");
+        assert_eq!(config.project.default_profile, "staging");
+
+        let error = set_default(&path, "missing")
+            .await
+            .expect_err("missing profile");
+        assert!(error.to_string().contains("preview"));
+        assert!(error.to_string().contains("staging"));
     }
 }

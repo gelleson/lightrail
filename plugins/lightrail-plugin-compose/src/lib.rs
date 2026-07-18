@@ -1,3 +1,11 @@
+//! Compose capability adapter and protocol boundary.
+//!
+//! This module translates protocol requests into the validated Compose
+//! contract. Compose inspection and generated documents live in
+//! `compose_model`; local/SSH process boundaries live in `command`; build,
+//! transfer, Traefik, runtime inspection, rollback, and readiness live in
+//! `runtime`.
+
 mod command;
 mod compose_model;
 pub mod contract;
@@ -42,7 +50,7 @@ impl PluginHandler for ComposePlugin {
             protocol: ProtocolCompatibility::default(),
             executable: ExecutableMetadata {
                 command: Some("lightrail-plugin-compose".to_owned()),
-                homepage: Some("https://github.com/lightrail-dev/lightrail".to_owned()),
+                homepage: Some("https://github.com/gelleson/lightrail".to_owned()),
                 ..ExecutableMetadata::default()
             },
             capabilities: vec![

@@ -8,8 +8,11 @@ machine.
 $ git switch feature-login
 $ lightrail up --profile preview
 
-frontend  https://feature-login.frontend.preview.myproject.cb00710a.sslip.io
-api       https://feature-login.api.preview.myproject.cb00710a.sslip.io
+Plan: up feature-login / preview
+  - ...
+feature-login / preview  ready
+  frontend         https://feature-login.frontend.preview.myproject.cb00710a.sslip.io
+  api              https://feature-login.api.preview.myproject.cb00710a.sslip.io
 
 $ lightrail down --profile preview
 ```
@@ -17,7 +20,9 @@ $ lightrail down --profile preview
 Lightrail resolves Docker Compose locally, builds the current checkout with
 Buildx, transfers missing images over SSH, deploys with Compose, and routes
 each public app through Traefik with ACME HTTP-01. It does not require GitHub,
-an image registry, a remote Lightrail daemon, or a central control plane.
+registry pushes for locally built services, a remote Lightrail daemon, or a
+central control plane. External Compose images still pull from their configured
+registries.
 
 > [!CAUTION]
 > The CLI, protocol, and bundled Compose, SSH, and Hetzner plugins are
@@ -49,13 +54,15 @@ an image registry, a remote Lightrail daemon, or a central control plane.
 - Repeated `up` reconciles the same branch environment. Plans, remote locks,
   bounded retries, journals, readiness checks, and best-effort rollback are
   implemented.
-- `status --all` and `urls --all` aggregate every environment rediscovered for
-  the project. Machine-isolated profiles fan out runtime inspection across
-  labeled machines and retain a degraded summary when one cannot be reached.
-- `down` is ownership-scoped and idempotent, including project-wide deletion
-  of labeled Hetzner servers and firewalls. `down --force` may bypass only an
-  unreachable machine-isolated remote lock authority; it never bypasses a
-  lock held by another operation and still requires destructive confirmation.
+- `status --all` and `urls --all` aggregate every project environment visible
+  through the selected profile's configured target. Machine-isolated profiles
+  fan out runtime inspection across labeled machines and retain a degraded
+  summary when one cannot be reached.
+- `down` is ownership-scoped and idempotent, including deletion of all
+  project-labeled Hetzner servers and firewalls visible to the selected
+  profile's target credentials. `down --force` may bypass only an unreachable
+  machine-isolated remote lock authority; it never bypasses a lock held by
+  another operation and still requires destructive confirmation.
 - Ctrl+C during `up` or `down` sends semantic cancellation to the active
   plugin and waits for its safe stopping point. A cancelled `up` then follows
   the normal rollback path unless `--keep-failed` was selected.
@@ -90,16 +97,21 @@ Run the following inside a Git repository whose root contains a Compose file:
 lightrail init
 lightrail up --dry-run
 lightrail up
-lightrail urls
-lightrail logs --follow
 lightrail down
 ```
 
-`init` discovers Compose services and ports, asks for the first profile, and
-writes `lightrail.toml`, `lightrail.lock`, and a `.lightrail/` ignore entry.
+`init` discovers Compose services and ports, creates a `preview` profile by
+default (`-p <name>` chooses another), and writes `lightrail.toml`,
+`lightrail.lock`, and a `.lightrail/` ignore entry.
 It refuses to replace an existing configuration unless `--force` is supplied.
-Use `lightrail doctor --target` after initialization to inspect the configured
-target as well as local tools.
+Destroy any live environments before using `--force` to change or remove
+profiles or targets; the project ID is preserved so owned resources remain
+discoverable.
+`up` performs preflight checks and prints each app URL. Use `up --dry-run` to
+inspect the plan, `doctor --target` for an explicit prerequisite check,
+`lightrail -o plain urls` for one raw URL per line, and `logs --follow` while
+debugging. `logs -o json` emits one compact JSON object per line so followed
+logs remain streamable.
 
 ### Non-interactive SSH initialization
 
@@ -176,7 +188,10 @@ lightrail up --dry-run
 ```
 
 The generated configuration contains only a reference to `hetzner-token`; the
-value is stored outside committed configuration.
+value is stored outside committed configuration. In headless CI, provide it
+through the CI secret variable `LIGHTRAIL_SECRET_HETZNER_TOKEN` instead. In
+general, `LIGHTRAIL_SECRET_` is followed by the uppercased secret name with
+non-alphanumeric characters replaced by `_`.
 
 ## Examples
 
@@ -193,17 +208,17 @@ repository's current branch; no GitHub remote is required.
 
 ## Commands
 
-Global options are `--profile <name>`, `--output human|json|plain`, and
-`--verbose`/`-v`.
+Global options are `--profile`/`-p <name>`,
+`--output`/`-o human|json|plain`, and `--verbose`/`-v`.
 
 ```text
-lightrail init [--from <answers.toml>] [--non-interactive] [--profile <name>] [--force]
-lightrail profile add <name>|list|show <name>|remove <name>
-lightrail up [--dry-run] [--keep-failed] [--lock-timeout <30s|2m>]
-lightrail status [--all]
-lightrail urls [--all]
+lightrail init [--from <answers.toml>] [--target ssh|hetzner] [--domain sslip.io|nip.io] [--profile <name>] [--force]
+lightrail profile add <name> [--from <profile>]|list|show <name>|remove <name>|default <name>
+lightrail up [-n|--dry-run] [--keep-failed] [--lock-timeout <30s|2m>]
+lightrail status [-a|--all]
+lightrail urls [-a|--all]
 lightrail logs [service] [--follow] [--tail <count>]
-lightrail down [--all] [--dry-run] [--yes] [--force] [--lock-timeout <30s|2m>]
+lightrail down [-a|--all] [-n|--dry-run] [--yes] [--force] [--lock-timeout <30s|2m>]
 lightrail doctor [--target]
 lightrail secret set <name> [--stdin]|list|delete <name>
 lightrail plugin install <path-or-https-url>|sync|list|inspect <id>|update <id>|remove <id>
@@ -213,7 +228,12 @@ lightrail version
 
 `version` prints the CLI release version. The protocol version is defined by
 the protocol crate; `plugin inspect` shows manifests for installed,
-third-party pinned plugins.
+third-party pinned plugins. Plugin commands run inside an initialized project
+and update that project's `lightrail.lock`.
+
+`--all` is target-scoped: it covers every project environment the selected
+profile's configured target and credentials can rediscover. Repeat it for each
+distinct profile target, then verify each provider or host independently.
 
 Usage/cost reporting, remote `exec`, authenticated tunnels, PR-provider
 automation, Fly.io, Kubernetes, k3s, custom DNS, and native Windows are not
@@ -226,7 +246,11 @@ See [the product specification](docs/product-spec.md),
 ## Development
 
 ```console
-cargo test --workspace
-cargo fmt --all -- --check
-cargo clippy --workspace --all-targets --all-features -- -D warnings
+make help
+make check
 ```
+
+The Makefile builds and tests the CLI plus every bundled plugin; plain Cargo
+workspace commands do the same. See [CONTRIBUTING.md](CONTRIBUTING.md) for the
+human workflow and [AGENTS.md](AGENTS.md) for the project map and invariants
+used by coding agents.

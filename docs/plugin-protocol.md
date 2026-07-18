@@ -68,10 +68,12 @@ source = "https://example.invalid/example-target"
 sha256 = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
 ```
 
-`plugin install` probes the manifest, installs the executable, and adds the
-pin. `plugin sync` installs existing pins; `plugin update` reprobes the pinned
-source; `plugin remove` removes the pin and installed version. Deployment never
-downloads a missing third-party plugin automatically.
+Plugin commands run inside an initialized Lightrail project and update that
+project's `lightrail.lock`. `plugin install` probes the manifest, installs the
+executable, and adds the pin. `plugin sync` installs existing pins; `plugin
+update` reprobes the pinned source; `plugin remove` removes the pin and
+installed version. Deployment never downloads a missing third-party plugin
+automatically.
 
 Before launch, core checks the source policy, basic lock structure, installed
 SHA-256 digest, handshake ID/version, negotiated protocol compatibility, and
@@ -91,7 +93,7 @@ A successful Compose plugin response has this shape, abbreviated only inside
 the JSON Schema:
 
 ```json
-{"jsonrpc":"2.0","id":1,"result":{"protocol_version":"1.0.0","session_id":"018f6fa7-8ec2-7a39-b899-725959e23d8a","manifest":{"id":"dev.lightrail.compose","name":"Lightrail Compose","version":"0.1.0","protocol":{"version":"1.0.0","requires":{"minimum":"1.0.0","maximum_exclusive":"2.0.0"}},"executable":{"command":"lightrail-plugin-compose","homepage":"https://github.com/lightrail-dev/lightrail"},"capabilities":["source","builder","runtime","exposure","dns"],"required_secrets":[{"name":"*","description":"Only app environment secret names explicitly referenced by lightrail.toml","required":false}],"config_schema":{"type":"object","properties":{}},"config_ui_hints":{}}}}
+{"jsonrpc":"2.0","id":1,"result":{"protocol_version":"1.0.0","session_id":"018f6fa7-8ec2-7a39-b899-725959e23d8a","manifest":{"id":"dev.lightrail.compose","name":"Lightrail Compose","version":"0.1.0","protocol":{"version":"1.0.0","requires":{"minimum":"1.0.0","maximum_exclusive":"2.0.0"}},"executable":{"command":"lightrail-plugin-compose","homepage":"https://github.com/gelleson/lightrail"},"capabilities":["source","builder","runtime","exposure","dns"],"required_secrets":[{"name":"*","description":"Only app environment secret names explicitly referenced by lightrail.toml","required":false}],"config_schema":{"type":"object","properties":{}},"config_ui_hints":{}}}}
 ```
 
 Protocol versions are canonical `major.minor.patch` strings. The manifest

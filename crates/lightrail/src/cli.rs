@@ -9,6 +9,7 @@ use crate::{
     error::CliError,
     orchestrator::{self, DownOptions, LogOptions, QueryOptions, UpOptions},
     output::{self, OutputFormat},
+    plugin_host::{HETZNER_PLUGIN_ID, SSH_PLUGIN_ID},
     project::LoadedProject,
     workspace::ProjectPaths,
 };
@@ -18,15 +19,16 @@ use crate::{
     name = "lightrail",
     version,
     about = "Agentless, isolated branch environments from Docker Compose",
-    propagate_version = true
+    propagate_version = true,
+    arg_required_else_help = true
 )]
 pub struct Cli {
-    /// Select a named profile (overrides `LIGHTRAIL_PROFILE` and project default).
-    #[arg(long, global = true, env = "LIGHTRAIL_PROFILE")]
+    /// Select a deployment profile where applicable; during init, name the first profile.
+    #[arg(short = 'p', long, global = true, env = "LIGHTRAIL_PROFILE")]
     pub profile: Option<String>,
 
-    /// Choose human, JSON, or plain output.
-    #[arg(long, global = true, value_enum, default_value_t)]
+    /// Choose human, JSON, or compact plain output.
+    #[arg(short = 'o', long, global = true, value_enum, default_value_t)]
     pub output: OutputFormat,
 
     /// Increase diagnostic verbosity (-vv for debug).
@@ -45,19 +47,19 @@ pub enum Command {
     Profile(ProfileArgs),
     /// Build and reconcile the current branch environment.
     Up(UpArgs),
-    /// Rediscover the current environment.
+    /// Show environment status and app URLs (`-o json` includes detailed state).
     Status(QueryArgs),
-    /// Print public HTTPS application URLs.
+    /// Print public HTTPS app URLs (`-o plain` prints one URL per line).
     Urls(QueryArgs),
-    /// Stream remote service logs.
+    /// Show or follow remote service logs (`-o json` emits JSON Lines).
     Logs(LogsArgs),
     /// Destroy isolated resources for the current environment.
     Down(DownArgs),
-    /// Validate local tools, plugins, credentials, and target access.
+    /// Validate local tools and optionally the configured target.
     Doctor(DoctorArgs),
     /// Manage secret values stored outside project configuration.
     Secret(SecretArgs),
-    /// Manage executable plugins.
+    /// Manage project-pinned executable plugins (run after `lightrail init`).
     Plugin(PluginArgs),
     /// Generate shell completion code.
     Completion { shell: Shell },
@@ -67,19 +69,27 @@ pub enum Command {
 
 #[derive(Debug, Args)]
 pub struct InitArgs {
-    /// Write configuration without interactive prompts.
+    /// Disable prompts; complete answers must come from --from.
     #[arg(long)]
     pub non_interactive: bool,
 
-    /// Answers file used for non-interactive initialization.
+    /// TOML or JSON answers file; implies --non-interactive.
     #[arg(long, value_name = "FILE")]
     pub from: Option<PathBuf>,
 
-    /// Name of the first profile.
-    #[arg(long, default_value = "preview")]
-    pub profile: String,
+    /// Select the deployment target without an extra prompt.
+    #[arg(long, value_enum)]
+    pub target: Option<init::TargetKind>,
 
-    /// Replace an existing lightrail.toml after validation.
+    /// Select the supported IP-DNS service.
+    #[arg(
+        long,
+        value_name = "DOMAIN",
+        value_parser = ["sslip.io", "nip.io"]
+    )]
+    pub domain: Option<String>,
+
+    /// Recreate the config with the same project ID; destroy live environments first.
     #[arg(long)]
     pub force: bool,
 }
@@ -92,19 +102,40 @@ pub struct ProfileArgs {
 
 #[derive(Debug, Subcommand)]
 pub enum ProfileCommand {
-    Add { name: String },
+    /// Add a profile by copying the currently selected profile.
+    Add {
+        /// Name for the new profile.
+        name: String,
+        /// Profile to copy instead of the selected or default profile.
+        #[arg(long, value_name = "PROFILE")]
+        from: Option<String>,
+    },
+    /// List every configured profile.
     List,
-    Show { name: String },
-    Remove { name: String },
+    /// Show one profile.
+    Show {
+        /// Profile to show.
+        name: String,
+    },
+    /// Remove a profile that has no live environments.
+    Remove {
+        /// Profile to remove.
+        name: String,
+    },
+    /// Make a profile the project default.
+    Default {
+        /// Profile to use when --profile is omitted.
+        name: String,
+    },
 }
 
 #[derive(Debug, Args)]
 pub struct UpArgs {
     /// Print the plan without making changes.
-    #[arg(long)]
+    #[arg(short = 'n', long)]
     pub dry_run: bool,
 
-    /// Preserve failed resources for debugging.
+    /// Preserve failed resources for debugging; they may remain billable.
     #[arg(long)]
     pub keep_failed: bool,
 
@@ -115,8 +146,8 @@ pub struct UpArgs {
 
 #[derive(Debug, Args)]
 pub struct QueryArgs {
-    /// Query every environment belonging to this project.
-    #[arg(long)]
+    /// Query every project environment visible through the selected profile's target.
+    #[arg(short = 'a', long)]
     pub all: bool,
 }
 
@@ -136,12 +167,12 @@ pub struct LogsArgs {
 
 #[derive(Debug, Args)]
 pub struct DownArgs {
-    /// Destroy every branch environment for this project.
-    #[arg(long)]
+    /// Destroy every project environment visible through the selected profile's target.
+    #[arg(short = 'a', long)]
     pub all: bool,
 
     /// Print the destruction plan without changing resources.
-    #[arg(long)]
+    #[arg(short = 'n', long)]
     pub dry_run: bool,
 
     /// Skip the interactive confirmation.
@@ -172,14 +203,19 @@ pub struct SecretArgs {
 
 #[derive(Debug, Subcommand)]
 pub enum SecretCommand {
+    /// Store or replace a project-scoped secret.
     Set {
+        /// Secret reference name used by lightrail.toml.
         name: String,
         /// Read the value from stdin instead of an interactive prompt.
         #[arg(long)]
         stdin: bool,
     },
+    /// List stored secret names without revealing values.
     List,
+    /// Delete a stored secret.
     Delete {
+        /// Secret name to delete.
         name: String,
     },
 }
@@ -192,12 +228,30 @@ pub struct PluginArgs {
 
 #[derive(Debug, Subcommand)]
 pub enum PluginCommand {
-    Install { source: String },
+    /// Install and pin a plugin from a local path or HTTPS URL.
+    Install {
+        /// Executable path or HTTPS download URL.
+        source: String,
+    },
+    /// Restore pinned plugins that are missing from the local cache.
     Sync,
+    /// List pinned third-party plugins.
     List,
-    Inspect { id: String },
-    Update { id: String },
-    Remove { id: String },
+    /// Show a plugin manifest and pin details.
+    Inspect {
+        /// Stable plugin identifier.
+        id: String,
+    },
+    /// Refresh one installed plugin from its pinned source.
+    Update {
+        /// Stable plugin identifier.
+        id: String,
+    },
+    /// Remove one third-party plugin pin and cached executable.
+    Remove {
+        /// Stable plugin identifier.
+        id: String,
+    },
 }
 
 fn parse_duration(value: &str) -> Result<Duration, String> {
@@ -222,37 +276,33 @@ pub async fn dispatch(cli: Cli) -> Result<(), CliError> {
     let format = cli.output;
     match cli.command {
         Command::Init(arguments) => {
+            if arguments.non_interactive && arguments.from.is_none() {
+                return Err(CliError::Usage(
+                    "`init --non-interactive` requires `--from <FILE>` with complete target answers"
+                        .into(),
+                ));
+            }
             let start = std::env::current_dir()?;
             let summary = init::run(init::InitOptions {
                 start,
-                profile: arguments.profile,
+                profile: selected_profile
+                    .clone()
+                    .unwrap_or_else(|| "preview".to_owned()),
+                target: arguments.target,
+                dns_domain: arguments.domain,
                 non_interactive: arguments.non_interactive || arguments.from.is_some(),
                 answers_file: arguments.from,
                 force: arguments.force,
             })
             .await?;
-            match format {
-                OutputFormat::Json => output::json(&summary),
-                OutputFormat::Plain => output::line(summary.config_path.display()),
-                OutputFormat::Human => {
-                    output::line(format!(
-                        "initialized `{}` at {}",
-                        summary.project_slug,
-                        summary.config_path.display()
-                    ))?;
-                    for app in summary.apps {
-                        output::line(format!("  {:<16} {}:{}", app.name, app.service, app.port))?;
-                    }
-                    Ok(())
-                }
-            }
+            print_init_summary(&summary, format)
         }
         Command::Profile(arguments) => {
             let paths = ProjectPaths::discover(&std::env::current_dir()?)?;
             match arguments.command {
-                ProfileCommand::Add { name } => {
-                    let mutation =
-                        profile::add(&paths.config, &name, selected_profile.as_deref()).await?;
+                ProfileCommand::Add { name, from } => {
+                    let template = from.as_deref().or(selected_profile.as_deref());
+                    let mutation = profile::add(&paths.config, &name, template).await?;
                     render_value(&mutation, format, format!("added profile `{name}`"))
                 }
                 ProfileCommand::List => {
@@ -269,11 +319,14 @@ pub async fn dispatch(cli: Cli) -> Result<(), CliError> {
                         OutputFormat::Human => {
                             for item in profiles {
                                 output::line(format!(
-                                    "{}{}  {:?}  target={}",
-                                    item.name,
-                                    if item.is_default { " (default)" } else { "" },
-                                    item.isolation,
-                                    item.target_plugin
+                                    "{:<20} {:<9} {}",
+                                    format!(
+                                        "{}{}",
+                                        item.name,
+                                        if item.is_default { " (default)" } else { "" }
+                                    ),
+                                    isolation_name(item.isolation),
+                                    target_name(&item.target_plugin),
                                 ))?;
                             }
                             Ok(())
@@ -299,8 +352,9 @@ pub async fn dispatch(cli: Cli) -> Result<(), CliError> {
                                 }
                             ))?;
                             output::line(format!(
-                                "  isolation: {:?}\n  apps: {}",
-                                selected.profile.isolation,
+                                "  isolation  {}\n  target     {}\n  apps       {}",
+                                isolation_name(selected.profile.isolation),
+                                target_name(selected.profile.pipeline.target.as_str()),
                                 selected.profile.apps.join(", ")
                             ))
                         }
@@ -311,6 +365,14 @@ pub async fn dispatch(cli: Cli) -> Result<(), CliError> {
                     let live = orchestrator::live_environment_count(project).await?;
                     let mutation = profile::remove(&paths.config, &name, live).await?;
                     render_value(&mutation, format, format!("removed profile `{name}`"))
+                }
+                ProfileCommand::Default { name } => {
+                    let mutation = profile::set_default(&paths.config, &name).await?;
+                    render_value(
+                        &mutation,
+                        format,
+                        format!("default profile is now `{name}`"),
+                    )
                 }
             }
         }
@@ -398,6 +460,54 @@ pub async fn dispatch(cli: Cli) -> Result<(), CliError> {
     }
 }
 
+fn print_init_summary(summary: &init::InitSummary, format: OutputFormat) -> Result<(), CliError> {
+    match format {
+        OutputFormat::Json => output::json(summary),
+        OutputFormat::Plain => output::line(summary.config_path.display()),
+        OutputFormat::Human => {
+            output::line(format!("Initialized `{}`", summary.project_slug))?;
+            output::line(format!("  config   {}", summary.config_path.display()))?;
+            output::line(format!("  profile  {}", summary.profile))?;
+            output::line(format!(
+                "  target   {} ({} isolation)",
+                summary.target,
+                isolation_name(summary.isolation)
+            ))?;
+            if let Some(detail) = &summary.target_detail {
+                output::line(format!("           {detail}"))?;
+            }
+            output::line(format!("  dns      {} (hex IPv4)", summary.dns_domain))?;
+            output::line("  apps")?;
+            for app in &summary.apps {
+                output::line(format!("    {:<16} {}:{}", app.name, app.service, app.port))?;
+            }
+            output::line("")?;
+            output::line("Next: lightrail up --dry-run")?;
+            if summary.target == init::TargetKind::Hetzner {
+                output::line(
+                    "  `up` asks once for `hetzner-token`; run `lightrail secret set hetzner-token` to store it for reuse.",
+                )?;
+            }
+            output::line("  Then deploy: lightrail up")
+        }
+    }
+}
+
+const fn isolation_name(isolation: lightrail_core::Isolation) -> &'static str {
+    match isolation {
+        lightrail_core::Isolation::Project => "project",
+        lightrail_core::Isolation::Machine => "machine",
+    }
+}
+
+fn target_name(plugin_id: &str) -> &str {
+    match plugin_id {
+        SSH_PLUGIN_ID => "Generic SSH host",
+        HETZNER_PLUGIN_ID => "Hetzner Cloud",
+        other => other,
+    }
+}
+
 fn render_value<T: serde::Serialize>(
     value: &T,
     format: OutputFormat,
@@ -442,6 +552,53 @@ mod tests {
         };
         assert!(up.dry_run);
         assert_eq!(up.lock_timeout, Duration::from_secs(120));
+    }
+
+    #[test]
+    fn init_profile_has_one_meaning_before_or_after_the_subcommand() {
+        let before = try_parse_from(["lightrail", "--profile", "staging", "init"]).expect("before");
+        let after = try_parse_from(["lightrail", "init", "--profile", "staging"]).expect("after");
+
+        assert_eq!(before.profile.as_deref(), Some("staging"));
+        assert_eq!(after.profile.as_deref(), Some("staging"));
+        assert!(matches!(before.command, Command::Init(_)));
+        assert!(matches!(after.command, Command::Init(_)));
+    }
+
+    #[test]
+    fn init_accepts_direct_target_and_domain_choices() {
+        let cli = try_parse_from([
+            "lightrail",
+            "init",
+            "--target",
+            "hetzner",
+            "--domain",
+            "nip.io",
+        ])
+        .expect("init choices");
+        let Command::Init(init) = cli.command else {
+            panic!("expected init");
+        };
+
+        assert_eq!(init.target, Some(init::TargetKind::Hetzner));
+        assert_eq!(init.domain.as_deref(), Some("nip.io"));
+        assert!(
+            try_parse_from(["lightrail", "init", "--domain", "example.com"]).is_err(),
+            "custom DNS providers are intentionally unsupported"
+        );
+    }
+
+    #[test]
+    fn common_short_options_are_available() {
+        let cli = try_parse_from(["lightrail", "-p", "preview", "-o", "plain", "up", "-n"])
+            .expect("short options");
+
+        assert_eq!(cli.profile.as_deref(), Some("preview"));
+        assert_eq!(cli.output, OutputFormat::Plain);
+        let Command::Up(up) = cli.command else {
+            panic!("expected up");
+        };
+        assert!(up.dry_run);
     }
 
     #[test]

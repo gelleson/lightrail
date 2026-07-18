@@ -1,9 +1,9 @@
 # Lightrail product specification
 
 Status: implemented MVP contract. The CLI, protocol, and bundled Compose, SSH,
-and Hetzner plugins are present and covered by automated tests. A live
-end-to-end deployment against a real SSH host or Hetzner account, including
-public ACME issuance, has not yet been completed.
+and Hetzner plugins are present and covered by automated tests. See the README
+for current live-validation status; this document intentionally keeps the
+behavioral contract independent of dated smoke-test results.
 
 This document turns the product interview into a durable behavioral
 specification. “Must” describes an MVP invariant. Where the current
@@ -275,7 +275,8 @@ environment.
 `lightrail init` is interactive by default and must:
 
 1. locate the Git project root and Compose input;
-2. ask for the first profile name, target, and target settings;
+2. create the first profile using `--profile` or the `preview` default, then
+   ask for the target and required target settings;
 3. detect Compose services, build contexts, and candidate ports;
 4. ask which services are public apps and which internal port each uses;
 5. create an immutable project ID and default profile;
@@ -291,10 +292,11 @@ The file-driven form accepts TOML or JSON:
 lightrail init --from answers.toml
 ```
 
-`--from` implies non-interactive mode; `--non-interactive` is also available
-without a file. `--profile <name>` chooses the first profile name, defaulting
-to `preview`. Initialization refuses to overwrite `lightrail.toml`; `--force`
-allows a validated replacement.
+`--from` implies non-interactive mode. The explicit `--non-interactive` flag
+requires `--from` because provider-specific settings need a complete input
+channel. `--profile <name>` chooses the first profile name, defaulting to
+`preview`. Initialization refuses to overwrite `lightrail.toml`; `--force`
+allows a validated replacement while preserving the immutable project ID.
 
 A generic SSH answers file requires `settings.target.host`. If `host` is not
 itself a publicly routable IPv4, `settings.target.public_ipv4` is also
@@ -698,14 +700,16 @@ labels; unrelated and external images remain.
 For machine isolation it deletes the managed VM and all attached
 Lightrail-managed resources.
 
-`down --all` targets every labeled environment belonging to the project and
-requires stronger explicit confirmation. On a shared host it deletes exactly
-owned containers, volumes, networks, generated environment directories, and
-labeled `lightrail/*` images while retaining shared Traefik. On Hetzner it
-discovers and deletes every project-labeled server and firewall, including
-branches other than the branch in the current worktree. Destruction is
-idempotent: rerunning `down` continues interrupted resource cleanup. Deletion
-is not rollback-capable.
+`down --all` targets every labeled project environment discoverable through
+the selected profile's configured target and credentials, and requires
+stronger explicit confirmation. On a shared host it deletes exactly owned
+containers, volumes, networks, generated environment directories, and labeled
+`lightrail/*` images while retaining shared Traefik. On Hetzner it discovers
+and deletes every visible project-labeled server and firewall, including
+branches other than the branch in the current worktree. Profiles pointing at a
+different host, provider account, or credential boundary must be cleaned
+separately. Destruction is idempotent: rerunning `down` continues interrupted
+resource cleanup. Deletion is not rollback-capable.
 
 `down --force` is a recovery override only for an unavailable remote lock
 authority in machine isolation. It does not bypass a lock reported as busy,
@@ -728,6 +732,12 @@ Resolution precedence is:
 1. CI/environment override;
 2. OS keyring;
 3. interactive prompt when interaction is allowed.
+
+The environment override is `LIGHTRAIL_SECRET_` plus the uppercased logical
+secret name with each non-alphanumeric character replaced by `_`. For example,
+`hetzner-token` resolves from `LIGHTRAIL_SECRET_HETZNER_TOKEN`. CI systems
+should populate that variable from their protected secret store rather than
+putting values in arguments or committed files.
 
 Plugins declare required secret names in their manifests. The core resolves
 only those names and sends their values through the plugin's JSON-RPC stdin
@@ -770,7 +780,7 @@ lightrail secret list
 lightrail secret delete <name>
 ```
 
-`list` shows names and metadata, never values.
+`list` shows names only, never values.
 
 ## 16. Agentless discovery and state
 
@@ -851,8 +861,8 @@ See [plugin-protocol.md](plugin-protocol.md) for the implemented wire contract.
 ### 18.1 Commands
 
 ```text
-lightrail init [--from <file>] [--non-interactive] [--profile <name>] [--force]
-lightrail profile add <name>|list|show <name>|remove <name>
+lightrail init [--from <file>] [--target ssh|hetzner] [--domain sslip.io|nip.io] [--profile <name>] [--force]
+lightrail profile add <name> [--from <profile>]|list|show <name>|remove <name>|default <name>
 lightrail up [--dry-run] [--keep-failed] [--lock-timeout <time>]
 lightrail status [--all]
 lightrail urls [--all]
@@ -868,17 +878,17 @@ lightrail version
 Global options:
 
 ```text
---profile <name>                select a profile
---output human|json|plain       select the output renderer
+-p, --profile <name>            select a profile; name the first one for init
+-o, --output human|json|plain   select the output renderer
 -v, --verbose                   increase diagnostic verbosity
 ```
 
 Important command options:
 
 ```text
---dry-run              display a plan without mutation (`up`, `down`)
+-n, --dry-run          display a plan without mutation (`up`, `down`)
 --keep-failed          preserve a failed deployment (`up`)
---all                  inspect or destroy all discovered project environments
+-a, --all              act on project environments visible through the selected profile target
 --follow               stream logs
 --tail <count>          historical log records, default 100
 --yes                  confirm destruction non-interactively
@@ -891,34 +901,41 @@ semantic operation cancellation, waits for the active plugin's safe stopping
 point, and then performs rollback or an orderly stop as applicable. The
 protocol client also cancels individually timed-out requests. Human-readable
 progress and errors go to stderr; command data and `--output json` output go
-to stdout. Any unsuccessful operation exits non-zero.
+to stdout. JSON log output is newline-delimited so followed logs remain
+streamable. Any unsuccessful operation exits non-zero.
 
 ### 18.2 Command behavior
 
-- `init`: discover Compose and create the project and first profile; `--force`
-  is required to replace an existing configuration.
-- `profile add|list|show|remove`: manage committed named profiles. `add` clones
-  the globally selected or default profile. Removal refuses to orphan
-  discovered live environments.
+- `init`: discover Compose and create the project and first profile. Target and
+  DNS flags can skip those interactive choices. `--force` is required to
+  reconfigure and must preserve the existing immutable project ID. Users must
+  destroy live environments before force-reconfiguring profiles or targets.
+- `profile add|list|show|remove|default`: manage committed named profiles.
+  `add` clones the `--from`, globally selected, or default profile, in that
+  order. `default` changes selection when `--profile` is omitted. Removal
+  refuses to orphan discovered live environments.
 - `up`: plan, build, transfer, deploy, verify, then print all app URLs.
 - `up --dry-run`: perform discovery and validation and print the complete
   obtainable plan without provisioning, building, or mutating.
 - `status`: rediscover and summarize the current environment.
 - `urls`: print every app and final HTTPS URL for the current environment.
-- `status --all` and `urls --all`: aggregate rediscovered project environments
-  with their branch/profile metadata, status, and endpoints. On a shared SSH
-  host Compose inspects exact labels and owned manifests. For machine
-  isolation the target returns every labeled machine and core fans out
-  downstream runtime inspection; an unreachable machine remains visible as a
-  degraded endpoint-free summary instead of hiding the rest of the project.
+- `status --all` and `urls --all`: aggregate project environments rediscovered
+  through the selected profile's configured target and credentials, with
+  branch/profile metadata, status, and endpoints. On a shared SSH host Compose
+  inspects exact labels and owned manifests. For machine isolation the target
+  returns every labeled machine visible to that provider configuration and
+  core fans out downstream runtime inspection; an unreachable machine remains
+  visible as a degraded endpoint-free summary instead of hiding the rest.
 - `logs [service] --follow`: read or stream logs from the selected environment;
   service is optional when the runtime supports aggregate logs.
 - `down`: execute the destruction contract in section 14.
+  Declining the pre-mutation confirmation is a successful no-op.
 - `doctor`: validate Git, the Docker client and daemon, Buildx, Compose, and
   OpenSSH. `doctor --target` additionally invokes target inspection with the
   selected profile and its credentials.
 - `secret`: manage named secret references through the configured local secret
-  store.
+  store. A missing secret entered during another interactive command is cached
+  only for that command and is never persisted implicitly.
 - `plugin`: explicitly install, pin, synchronize, inspect, update, list, and
   remove plugin executables.
 - `completion`: generate shell completion.

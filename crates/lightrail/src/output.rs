@@ -22,6 +22,15 @@ pub fn json<T: Serialize + ?Sized>(value: &T) -> Result<(), CliError> {
     Ok(())
 }
 
+/// Write one compact JSON value followed by a newline.
+pub fn json_line<T: Serialize + ?Sized>(value: &T) -> Result<(), CliError> {
+    let stdout = io::stdout();
+    let mut lock = stdout.lock();
+    serde_json::to_writer(&mut lock, value)?;
+    writeln!(lock)?;
+    Ok(())
+}
+
 pub fn line(value: impl std::fmt::Display) -> Result<(), CliError> {
     let stdout = io::stdout();
     let mut lock = stdout.lock();

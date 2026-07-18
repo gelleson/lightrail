@@ -6,10 +6,12 @@ pub enum CliError {
     #[error("{0}")]
     Usage(String),
 
-    #[error("configuration error: {0}")]
+    #[error("{0}")]
     Config(String),
 
-    #[error("project not initialized (could not find lightrail.toml from {start})")]
+    #[error(
+        "no lightrail.toml found from {start}\nhelp: run `lightrail init` inside the Git repository you want to deploy"
+    )]
     ProjectNotInitialized { start: PathBuf },
 
     #[error("required tool `{tool}` is unavailable: {detail}")]
@@ -18,10 +20,10 @@ pub enum CliError {
     #[error("secret `{name}` is unavailable; set it with `lightrail secret set {name}` or {env}")]
     SecretUnavailable { name: String, env: String },
 
-    #[error("plugin error: {0}")]
+    #[error("{0}")]
     Plugin(String),
 
-    #[error("operation failed: {0}")]
+    #[error("{0}")]
     Operation(String),
 
     #[error(transparent)]

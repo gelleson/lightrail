@@ -29,6 +29,10 @@ pub struct InitOptions {
     pub start: PathBuf,
     /// First committed profile name.
     pub profile: String,
+    /// Optional target override from the command line.
+    pub target: Option<TargetKind>,
+    /// Optional DNS-domain override from the command line.
+    pub dns_domain: Option<String>,
     /// Do not open a terminal prompt.
     pub non_interactive: bool,
     /// Optional TOML or JSON answers file.
@@ -84,7 +88,7 @@ pub struct AppAnswer {
 }
 
 /// Supported initial target choices.
-#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize, clap::ValueEnum)]
 #[serde(rename_all = "snake_case")]
 pub enum TargetKind {
     /// An existing generic Linux host reached with OpenSSH.
@@ -129,6 +133,9 @@ pub struct InitSummary {
     pub apps: Vec<InitializedApp>,
     pub target: TargetKind,
     pub isolation: Isolation,
+    pub dns_domain: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub target_detail: Option<String>,
 }
 
 /// One app created by initialization.
@@ -152,7 +159,7 @@ pub async fn run(options: InitOptions) -> Result<InitSummary, CliError> {
         .map_err(|error| CliError::Usage(error.to_string()))?;
     let root = git.repo_root();
     let paths = ProjectPaths::at(root);
-    refuse_existing_config(&paths.config, options.force)?;
+    let _ = existing_project_id(&paths.config, options.force)?;
 
     let answers = load_answers(options.answers_file.as_deref(), &options.start).await?;
     let discovered = discover_compose_files(root)?;
@@ -182,30 +189,31 @@ pub async fn initialize_from_inventory(
     mut answers: InitAnswers,
 ) -> Result<InitSummary, CliError> {
     let paths = ProjectPaths::at(root);
-    refuse_existing_config(&paths.config, options.force)?;
+    let project_id =
+        existing_project_id(&paths.config, options.force)?.unwrap_or_else(ProjectId::new);
     inventory.validate_remote_safety()?;
 
     let interactive = !options.non_interactive;
     let default_slug = default_project_slug(root, inventory.project_name.as_deref())?;
     let project_slug = choose_project_slug(answers.project_slug.take(), default_slug, interactive)?;
-    let target = choose_target(answers.target, interactive)?;
+    let target = choose_target(options.target.or(answers.target), interactive)?;
     let isolation = answers
         .isolation
         .unwrap_or_else(|| target.default_isolation());
+    validate_target_isolation(target, isolation)?;
     let apps = choose_apps(&inventory, answers.apps, interactive)?;
     let app_names = apps.keys().cloned().collect::<Vec<_>>();
-    let settings = build_settings(
-        target,
-        answers.dns_domain.as_deref(),
-        answers.settings,
-        interactive,
-    )?;
+    let dns_domain = options
+        .dns_domain
+        .as_deref()
+        .or(answers.dns_domain.as_deref());
+    let settings = build_settings(target, dns_domain, answers.settings, interactive)?;
     let pipeline = build_pipeline(target)?;
 
     let config = LightrailConfig {
         schema: CONFIG_SCHEMA_VERSION,
         project: Project {
-            id: ProjectId::new(),
+            id: project_id,
             slug: project_slug.clone(),
             compose: compose.clone(),
             default_profile: options.profile.clone(),
@@ -239,6 +247,18 @@ pub async fn initialize_from_inventory(
             port: app.port,
         })
         .collect();
+    let initialized_profile = config
+        .profile(&options.profile)
+        .expect("the initial profile was inserted above");
+    let dns_domain = initialized_profile
+        .settings
+        .get("dns")
+        .and_then(toml::Value::as_table)
+        .and_then(|settings| settings.get("domain"))
+        .and_then(toml::Value::as_str)
+        .unwrap_or("sslip.io")
+        .to_owned();
+    let target_detail = summarize_target(target, initialized_profile.settings.get("target"));
     Ok(InitSummary {
         config_path: paths.config,
         project_id: config.project.id.to_string(),
@@ -248,7 +268,37 @@ pub async fn initialize_from_inventory(
         apps: initialized_apps,
         target,
         isolation,
+        dns_domain,
+        target_detail,
     })
+}
+
+fn summarize_target(target: TargetKind, settings: Option<&toml::Value>) -> Option<String> {
+    let settings = settings.and_then(toml::Value::as_table)?;
+    match target {
+        TargetKind::Ssh => {
+            let host = settings.get("host").and_then(toml::Value::as_str)?;
+            let user = settings
+                .get("user")
+                .and_then(toml::Value::as_str)
+                .unwrap_or("root");
+            Some(format!("{user}@{host}"))
+        }
+        TargetKind::Hetzner => {
+            let server_type = settings
+                .get("server_type")
+                .and_then(toml::Value::as_str)
+                .unwrap_or("cx23");
+            let location = settings
+                .get("location")
+                .and_then(toml::Value::as_str)
+                .map_or_else(
+                    || "provider-selected location".to_owned(),
+                    |location| format!("location {location}"),
+                );
+            Some(format!("{server_type}, {location}"))
+        }
+    }
 }
 
 /// Finds root-level Compose files in deterministic merge-candidate order.
@@ -407,6 +457,19 @@ fn choose_target(answer: Option<TargetKind>, interactive: bool) -> Result<Target
     Ok(targets[selected])
 }
 
+fn validate_target_isolation(target: TargetKind, isolation: Isolation) -> Result<(), CliError> {
+    if isolation == target.default_isolation() {
+        return Ok(());
+    }
+    let supported = match target {
+        TargetKind::Ssh => "project",
+        TargetKind::Hetzner => "machine",
+    };
+    Err(CliError::Config(format!(
+        "{target} supports only `{supported}` isolation"
+    )))
+}
+
 fn choose_apps(
     inventory: &ComposeInventory,
     answers: Vec<AppAnswer>,
@@ -453,15 +516,7 @@ fn choose_apps(
     let mut apps = BTreeMap::new();
     for service in selected {
         let port = choose_service_port(service, interactive)?;
-        let name = if interactive {
-            Input::<String>::with_theme(&ColorfulTheme::default())
-                .with_prompt(format!("Public app name for `{}`", service.name))
-                .default(service.name.clone())
-                .interact_text()
-                .map_err(|error| prompt_error(&error))?
-        } else {
-            service.name.clone()
-        };
+        let name = service.name.clone();
         let app = App {
             service: service.name.clone(),
             port,
@@ -638,10 +693,7 @@ fn build_settings(
         (
             "dns".into(),
             toml::Value::Table(toml::Table::from_iter([
-                (
-                    "domain".into(),
-                    toml::Value::String(validate_dns_domain(dns_domain.unwrap_or("sslip.io"))?),
-                ),
+                ("domain".into(), toml::Value::String("sslip.io".into())),
                 ("encoding".into(), toml::Value::String("hex-ipv4".into())),
             ])),
         ),
@@ -655,6 +707,19 @@ fn build_settings(
             answer,
         );
     }
+
+    let dns = settings
+        .get_mut("dns")
+        .and_then(toml::Value::as_table_mut)
+        .ok_or_else(|| CliError::Config("`settings.dns` must be a table".into()))?;
+    let effective_domain = dns_domain
+        .or_else(|| dns.get("domain").and_then(toml::Value::as_str))
+        .unwrap_or("sslip.io");
+    dns.insert(
+        "domain".into(),
+        toml::Value::String(validate_dns_domain(effective_domain)?),
+    );
+    dns.insert("encoding".into(), toml::Value::String("hex-ipv4".into()));
     Ok(settings)
 }
 
@@ -792,25 +857,11 @@ fn hetzner_settings(
         .map(|value| string_list(value, "settings.target.allowed_ssh_cidrs"))
         .transpose()?;
 
-    let server_type = if interactive && server_type.is_none() {
-        Input::<String>::with_theme(&ColorfulTheme::default())
-            .with_prompt("Hetzner server type")
-            .default("cx23".into())
-            .interact_text()
-            .map_err(|error| prompt_error(&error))?
-    } else {
-        server_type.unwrap_or_else(|| "cx23".into())
-    };
-    let location = if interactive && location.is_none() {
-        Some(
-            Input::<String>::with_theme(&ColorfulTheme::default())
-                .with_prompt("Hetzner location")
-                .default("nbg1".into())
-                .interact_text()
-                .map_err(|error| prompt_error(&error))?,
-        )
-    } else {
-        location
+    let server_type = server_type.unwrap_or_else(|| "cx23".into());
+    let location = match (location, interactive) {
+        (Some(location), _) => Some(location),
+        (None, true) => Some("nbg1".into()),
+        (None, false) => None,
     };
     let ssh_keys = match (ssh_keys, interactive) {
         (Some(keys), _) if !keys.is_empty() => keys,
@@ -825,10 +876,10 @@ fn hetzner_settings(
     };
     let allowed_ssh_cidrs = match (allowed_ssh_cidrs, interactive) {
         (Some(cidrs), _) if !cidrs.is_empty() => cidrs,
-        (_, true) => comma_separated_prompt(
-            "CIDRs allowed to reach SSH (for example 198.51.100.42/32)",
+        (_, true) => normalize_interactive_ssh_sources(comma_separated_prompt(
+            "IP addresses or CIDRs allowed to reach SSH",
             "allowed_ssh_cidrs",
-        )?,
+        )?)?,
         _ => {
             return Err(CliError::Config(
                 "Hetzner init needs `settings.target.allowed_ssh_cidrs`; use a narrow source CIDR, never 0.0.0.0/0".into(),
@@ -927,6 +978,24 @@ fn validate_ssh_cidrs(cidrs: &[String]) -> Result<(), CliError> {
     Ok(())
 }
 
+fn normalize_interactive_ssh_sources(sources: Vec<String>) -> Result<Vec<String>, CliError> {
+    sources
+        .into_iter()
+        .map(|source| {
+            if source.contains('/') {
+                return Ok(source);
+            }
+            let address = source.parse::<std::net::IpAddr>().map_err(|_| {
+                CliError::Config(format!(
+                    "SSH source `{source}` must be an IP address or CIDR"
+                ))
+            })?;
+            let prefix = if address.is_ipv4() { 32 } else { 128 };
+            Ok(format!("{address}/{prefix}"))
+        })
+        .collect()
+}
+
 fn merge_value(base: &mut toml::Value, overlay: toml::Value) {
     match (base, overlay) {
         (toml::Value::Table(base), toml::Value::Table(overlay)) => {
@@ -978,19 +1047,28 @@ fn likely_public_service(service: &ServiceInventory) -> bool {
             .any(|port| !PRIVATE_PORTS.contains(port))
 }
 
-fn refuse_existing_config(path: &Path, force: bool) -> Result<(), CliError> {
-    if path.exists() && !force {
-        Err(CliError::Usage(format!(
+fn existing_project_id(path: &Path, force: bool) -> Result<Option<ProjectId>, CliError> {
+    if !path.try_exists()? {
+        return Ok(None);
+    }
+    if !force {
+        return Err(CliError::Usage(format!(
             "{} already exists; pass --force to replace it",
             path.display()
-        )))
-    } else {
-        Ok(())
+        )));
     }
+    LightrailConfig::load(path)
+        .map(|config| Some(config.project.id))
+        .map_err(|error| {
+            CliError::Config(format!(
+                "refusing to replace invalid existing configuration at {}: {error}",
+                path.display()
+            ))
+        })
 }
 
 async fn write_config(path: &Path, contents: &str, force: bool) -> Result<(), CliError> {
-    refuse_existing_config(path, force)?;
+    let _ = existing_project_id(path, force)?;
     let project_id = ProjectId::new().simple();
     let temporary = path.with_file_name(format!(".{CONFIG_FILE}.{project_id}.tmp"));
     tokio::fs::write(&temporary, contents).await?;
@@ -1112,6 +1190,8 @@ mod tests {
         InitOptions {
             start: root.to_path_buf(),
             profile: "preview".into(),
+            target: None,
+            dns_domain: None,
             non_interactive: true,
             answers_file: None,
             force: false,
@@ -1134,8 +1214,117 @@ mod tests {
     #[test]
     fn rejects_world_open_hetzner_ssh_cidr() {
         assert!(validate_ssh_cidrs(&["198.51.100.42/32".into()]).is_ok());
+        assert!(validate_ssh_cidrs(&["198.51.100.42".into()]).is_err());
         assert!(validate_ssh_cidrs(&["0.0.0.0/0".into()]).is_err());
         assert!(validate_ssh_cidrs(&["::/0".into()]).is_err());
+    }
+
+    #[test]
+    fn interactive_ssh_sources_accept_bare_addresses() {
+        let normalized = normalize_interactive_ssh_sources(vec![
+            "198.51.100.42".into(),
+            "2001:db8::1".into(),
+            "203.0.113.0/24".into(),
+        ])
+        .expect("normalize");
+
+        assert_eq!(
+            normalized,
+            ["198.51.100.42/32", "2001:db8::1/128", "203.0.113.0/24"]
+        );
+        assert!(validate_ssh_cidrs(&normalized).is_ok());
+    }
+
+    #[test]
+    fn interactive_hetzner_uses_existing_type_and_location_defaults() {
+        let supplied = toml::Value::Table(toml::Table::from_iter([
+            (
+                "ssh_keys".into(),
+                toml::Value::Array(vec![toml::Value::String("developer".into())]),
+            ),
+            (
+                "allowed_ssh_cidrs".into(),
+                toml::Value::Array(vec![toml::Value::String("198.51.100.42/32".into())]),
+            ),
+        ]));
+
+        let settings = hetzner_settings(Some(&supplied), true).expect("settings");
+        let settings = settings.as_table().expect("table");
+        assert_eq!(
+            settings.get("server_type").and_then(toml::Value::as_str),
+            Some("cx23")
+        );
+        assert_eq!(
+            settings.get("location").and_then(toml::Value::as_str),
+            Some("nbg1")
+        );
+        assert_eq!(
+            summarize_target(
+                TargetKind::Hetzner,
+                Some(&toml::Value::Table(settings.clone()))
+            ),
+            Some("cx23, location nbg1".into())
+        );
+    }
+
+    #[test]
+    fn noninteractive_hetzner_can_leave_location_to_the_provider() {
+        let supplied = toml::Value::Table(toml::Table::from_iter([
+            (
+                "ssh_keys".into(),
+                toml::Value::Array(vec![toml::Value::String("developer".into())]),
+            ),
+            (
+                "allowed_ssh_cidrs".into(),
+                toml::Value::Array(vec![toml::Value::String("198.51.100.42/32".into())]),
+            ),
+        ]));
+
+        let settings = hetzner_settings(Some(&supplied), false).expect("settings");
+        let settings = settings.as_table().expect("table");
+        assert!(!settings.contains_key("location"));
+        assert_eq!(
+            summarize_target(
+                TargetKind::Hetzner,
+                Some(&toml::Value::Table(settings.clone()))
+            ),
+            Some("cx23, provider-selected location".into())
+        );
+    }
+
+    #[test]
+    fn bundled_targets_reject_incompatible_isolation_early() {
+        assert!(validate_target_isolation(TargetKind::Ssh, Isolation::Project).is_ok());
+        assert!(validate_target_isolation(TargetKind::Hetzner, Isolation::Machine).is_ok());
+        assert!(validate_target_isolation(TargetKind::Ssh, Isolation::Machine).is_err());
+        assert!(validate_target_isolation(TargetKind::Hetzner, Isolation::Project).is_err());
+    }
+
+    #[test]
+    fn explicit_dns_choice_wins_and_hex_encoding_cannot_be_overridden() {
+        let settings = BTreeMap::from([
+            (
+                "target".into(),
+                toml::Value::Table(toml::Table::from_iter([(
+                    "host".into(),
+                    toml::Value::String("8.8.8.8".into()),
+                )])),
+            ),
+            (
+                "dns".into(),
+                toml::Value::Table(toml::Table::from_iter([
+                    ("domain".into(), toml::Value::String("sslip.io".into())),
+                    ("encoding".into(), toml::Value::String("decimal".into())),
+                ])),
+            ),
+        ]);
+
+        let generated =
+            build_settings(TargetKind::Ssh, Some("nip.io"), settings, false).expect("settings");
+        let dns = generated["dns"].as_table().expect("DNS table");
+
+        assert_eq!(dns["domain"].as_str(), Some("nip.io"));
+        assert_eq!(dns["encoding"].as_str(), Some("hex-ipv4"));
     }
 
     #[tokio::test]
@@ -1178,6 +1367,8 @@ mod tests {
 
         assert_eq!(summary.project_slug, "storefront");
         assert_eq!(summary.apps[0].name, "web");
+        assert_eq!(summary.dns_domain, "nip.io");
+        assert_eq!(summary.target_detail.as_deref(), Some("deploy@8.8.8.8"));
         let config =
             LightrailConfig::load(temp.path().join(CONFIG_FILE)).expect("valid persisted config");
         assert_eq!(config.apps.len(), 1);
@@ -1201,6 +1392,34 @@ mod tests {
                 .expect("lock"),
             PluginLock::default()
         );
+    }
+
+    #[tokio::test]
+    async fn inventory_boundary_applies_cli_target_and_domain_overrides() {
+        let temp = tempfile::tempdir().expect("temp");
+        tokio::fs::write(temp.path().join("compose.yaml"), "services: {}\n")
+            .await
+            .expect("fixture");
+        let mut init_options = options(temp.path());
+        init_options.target = Some(TargetKind::Ssh);
+        init_options.dns_domain = Some("nip.io".into());
+        let mut answers = noninteractive_ssh_answers();
+        answers.target = Some(TargetKind::Hetzner);
+        answers.dns_domain = Some("sslip.io".into());
+
+        let summary = initialize_from_inventory(
+            &init_options,
+            temp.path(),
+            vec![PathBuf::from("compose.yaml")],
+            inventory_fixture(),
+            answers,
+        )
+        .await
+        .expect("initialize with CLI overrides");
+
+        assert_eq!(summary.target, TargetKind::Ssh);
+        assert_eq!(summary.isolation, Isolation::Project);
+        assert_eq!(summary.dns_domain, "nip.io");
     }
 
     #[tokio::test]
@@ -1243,6 +1462,80 @@ mod tests {
         .expect("forced replacement");
     }
 
+    #[tokio::test]
+    async fn force_reconfiguration_preserves_project_id() {
+        let temp = tempfile::tempdir().expect("temp");
+        tokio::fs::write(temp.path().join("compose.yaml"), "services: {}\n")
+            .await
+            .expect("fixture");
+        let initial = options(temp.path());
+        initialize_from_inventory(
+            &initial,
+            temp.path(),
+            vec![PathBuf::from("compose.yaml")],
+            inventory_fixture(),
+            noninteractive_ssh_answers(),
+        )
+        .await
+        .expect("initial configuration");
+        let original = LightrailConfig::load(temp.path().join(CONFIG_FILE)).expect("original");
+
+        let mut forced = options(temp.path());
+        forced.force = true;
+        let mut answers = noninteractive_ssh_answers();
+        answers.project_slug = Some("renamed-shop".into());
+        let summary = initialize_from_inventory(
+            &forced,
+            temp.path(),
+            vec![PathBuf::from("compose.yaml")],
+            inventory_fixture(),
+            answers,
+        )
+        .await
+        .expect("forced reconfiguration");
+        let replaced = LightrailConfig::load(temp.path().join(CONFIG_FILE)).expect("replacement");
+
+        assert_eq!(replaced.project.id, original.project.id);
+        assert_eq!(summary.project_id, original.project.id.to_string());
+        assert_eq!(replaced.project.slug, "renamed-shop");
+    }
+
+    #[tokio::test]
+    async fn force_reconfiguration_refuses_an_invalid_existing_config() {
+        let temp = tempfile::tempdir().expect("temp");
+        tokio::fs::write(temp.path().join("compose.yaml"), "services: {}\n")
+            .await
+            .expect("fixture");
+        let invalid = "schema = [\n";
+        tokio::fs::write(temp.path().join(CONFIG_FILE), invalid)
+            .await
+            .expect("invalid config");
+        let mut forced = options(temp.path());
+        forced.force = true;
+
+        let error = initialize_from_inventory(
+            &forced,
+            temp.path(),
+            vec![PathBuf::from("compose.yaml")],
+            inventory_fixture(),
+            noninteractive_ssh_answers(),
+        )
+        .await
+        .expect_err("invalid existing config must be preserved");
+
+        assert!(
+            error
+                .to_string()
+                .contains("refusing to replace invalid existing configuration")
+        );
+        assert_eq!(
+            tokio::fs::read_to_string(temp.path().join(CONFIG_FILE))
+                .await
+                .expect("preserved config"),
+            invalid
+        );
+    }
+
     #[test]
     fn compose_discovery_prefers_canonical_base_file() {
         let temp = tempfile::tempdir().expect("temp");
@@ -1264,11 +1557,12 @@ mod tests {
     }
 
     #[test]
-    fn noninteractive_detection_keeps_private_database_internal() {
+    fn detected_apps_use_service_names_and_keep_private_database_internal() {
         let apps = choose_apps(&inventory_fixture(), Vec::new(), false).expect("apps");
 
         assert_eq!(apps.len(), 1);
         assert!(apps.contains_key("frontend"));
+        assert_eq!(apps["frontend"].service, "frontend");
         assert!(!apps.contains_key("db"));
     }
 

@@ -29,6 +29,7 @@ deletion; the final reinspection reports it as remaining instead. These
 limitations are explicit consequences of an agentless, no-central-state
 design.
 
-`destroy.force = true` deliberately bypasses the remote lock so an unreachable
-machine can still be removed through the provider API after core obtains the
-user's destructive confirmation.
+`destroy.force = true` is narrow recovery for a machine whose remote lock
+authority is unavailable. Core still requires destructive confirmation and
+ownership-scoped provider discovery. Force never bypasses a lock known to be
+held by another operation.

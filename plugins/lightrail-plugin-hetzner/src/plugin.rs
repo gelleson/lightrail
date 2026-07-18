@@ -1,3 +1,11 @@
+//! Hetzner target lifecycle and machine-backed operation-lock authority.
+//!
+//! `PluginHandler` implements the wire-facing operations. The inherent
+//! `HetznerPlugin` methods perform provider discovery and reconciliation,
+//! teardown, and remote lock continuity. Pure state, plan, and journal helpers
+//! follow those lifecycle methods. Keep provider ownership checks and the
+//! remote/in-process lock transition together when changing this module.
+
 use std::{
     collections::{HashMap, HashSet},
     path::Path,
@@ -181,7 +189,7 @@ impl PluginHandler for HetznerPlugin {
             protocol: ProtocolCompatibility::default(),
             executable: ExecutableMetadata {
                 command: Some("lightrail-plugin-hetzner".to_owned()),
-                homepage: Some("https://github.com/lightrail-dev/lightrail".to_owned()),
+                homepage: Some("https://github.com/gelleson/lightrail".to_owned()),
                 ..ExecutableMetadata::default()
             },
             capabilities: vec![Capability::Target, Capability::OperationLock],

@@ -21,25 +21,37 @@ git add .
 git commit -m "Start single-app example"
 ```
 
-Choose a target template, copy it to `lightrail.init.toml`, and replace its
-`REPLACE` values:
+Choose one target template and replace its `REPLACE` values.
+
+For an existing generic SSH host:
 
 ```console
-# Existing generic SSH host:
 cp lightrail.init.ssh.example.toml lightrail.init.toml
-
-# Or a dedicated Hetzner machine:
-cp lightrail.init.hetzner.example.toml lightrail.init.toml
-lightrail secret set hetzner-token
-
 $EDITOR lightrail.init.toml
 lightrail init --from lightrail.init.toml
+```
+
+For a dedicated Hetzner machine:
+
+```console
+cp lightrail.init.hetzner.example.toml lightrail.init.toml
+$EDITOR lightrail.init.toml
+lightrail init --from lightrail.init.toml
+# Optional: store the token once instead of entering it during each command.
+lightrail secret set hetzner-token
+```
+
+Then review and deploy:
+
+```console
 rm lightrail.init.toml
 git add lightrail.toml lightrail.lock .gitignore
 git commit -m "Configure Lightrail"
+lightrail up --dry-run
 lightrail up
-lightrail urls
 ```
+
+`up` prints the app URL. Run `lightrail -o plain urls` for only the raw URL.
 
 The Hetzner template expects an account SSH key whose matching private key is
 available locally, plus a narrow operator CIDR such as your current public

@@ -1,8 +1,9 @@
 # Lightrail architecture
 
 Status: implemented MVP architecture. The code and automated tests exercise
-the component boundaries described here; a live end-to-end generic SSH and
-Hetzner deployment has not yet been completed.
+the component boundaries described here. See the README for current
+live-validation status; this document intentionally keeps the component model
+independent of dated smoke-test results.
 
 The protocol supports request cancellation and the client cancels timed-out
 requests. Followed logs stop on Ctrl+C. During `up` and `down`, Ctrl+C sends
@@ -188,10 +189,13 @@ plugins must round-trip these semantics. A target's `inspect` operation returns
 observations, not assumptions derived solely from local cache.
 
 For `status --all` and `urls --all`, Compose aggregates
-`state.environments` from exact Docker labels and owned remote manifests. A
-machine-isolated target instead returns `state.targets`; core fans runtime
-inspection out to each labeled machine, merges environment metadata and
-endpoints, and keeps an unreachable machine visible as a degraded summary.
+`state.environments` from exact Docker labels and owned remote manifests
+visible through the selected profile's configured target. A machine-isolated
+target instead returns `state.targets`; core fans runtime inspection out to
+each labeled machine returned by that provider configuration, merges
+environment metadata and endpoints, and keeps an unreachable machine visible
+as a degraded summary. Profiles using a different host or provider credential
+boundary require a separate query.
 
 ### 3.4 Deterministic identity
 
@@ -292,10 +296,11 @@ current build context --Buildx--> target-platform tagged image
                                       +-- different/missing: stream -> docker load
 ```
 
-No registry is required. The remote machine does not receive a source-tree
-checkout. External `image:` references are pulled remotely for the target
-platform and remain as configured references in the deployment. Their observed
-image IDs and repository digests are recorded after apply; strict digest
+No registry push is required for locally built services. The remote machine
+does not receive a source-tree checkout. External `image:` references are
+pulled remotely for the target platform and remain as configured references in
+the deployment. Their observed image IDs and repository digests are recorded
+after apply; strict digest
 rewriting is not implemented.
 
 ### 4.4 Generated deployment
@@ -555,13 +560,15 @@ shared resources and other environments. Machine isolation includes the
 entire environment-owned VM. Steps are idempotent so an interrupted `down` can
 continue from observed state rather than trusting a stale journal.
 
-`down --all` expands the ownership query from one environment to the entire
-immutable project ID and therefore requires stronger confirmation. On a
-shared SSH host it removes exactly owned containers, volumes, networks,
-generated environment directories, and labeled `lightrail/*` images while
-retaining shared Traefik. On a Hetzner profile it deletes every project-labeled
-server and firewall, including resources belonging to branches other than the
-current checkout.
+`down --all` expands the selected target's ownership query from one
+environment to the immutable project ID and therefore requires stronger
+confirmation. On a shared SSH host it removes exactly owned containers,
+volumes, networks, generated environment directories, and labeled
+`lightrail/*` images while retaining shared Traefik. On a Hetzner profile it
+deletes every project-labeled server and firewall visible through that
+profile's provider configuration, including resources belonging to branches
+other than the current checkout. A different profile target or credential
+boundary is outside that invocation and must be cleaned separately.
 
 If an environment manifest is missing, Compose does not infer absence from
 that file alone. It queries containers, networks, volumes, and `lightrail/*`
