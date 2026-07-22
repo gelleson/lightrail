@@ -42,7 +42,7 @@ case "$OS" in
         TARGET="${ARCH}-unknown-linux-musl"
         ;;
     darwin)
-        TARGET="${ARCH}-apple-darwin"
+        TARGET="aarch64-apple-darwin"
         ;;
     *)
         echo "Error: Unsupported operating system: $OS" >&2

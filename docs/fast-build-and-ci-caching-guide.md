@@ -118,8 +118,7 @@ Options via environment variables:
    - Builds matrix targets:
      - `x86_64-unknown-linux-musl` (Static Linux x86_64)
      - `aarch64-unknown-linux-musl` (Static Linux ARM64)
-     - `x86_64-apple-darwin` (macOS Intel)
-     - `aarch64-apple-darwin` (macOS Apple Silicon)
+     - `aarch64-apple-darwin` (macOS ARM64 / Apple Silicon)
    - Bundles all 6 executables (`lightrail`, `lightrail-plugin-compose`, `lightrail-plugin-fly`, `lightrail-plugin-hetzner`, `lightrail-plugin-kubernetes`, `lightrail-plugin-ssh`).
    - Generates `.tar.gz` release archives and `.sha256` checksums.
    - Publishes a new GitHub Release automatically.
