@@ -1,0 +1,126 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+jobs:
+  build-release:
+    name: Build Release Binary (${{ matrix.target }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-musl
+            os: ubuntu-latest
+            use_cross: false
+          - target: aarch64-unknown-linux-musl
+            os: ubuntu-latest
+            use_cross: true
+          - target: x86_64-apple-darwin
+            os: macos-13
+            use_cross: false
+          - target: aarch64-apple-darwin
+            os: macos-14
+            use_cross: false
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: '1.85'
+          targets: ${{ matrix.target }}
+
+      - name: Setup Cargo cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          prefix-key: "v1-rust-release-${{ matrix.target }}"
+          workspaces: ". -> target"
+
+
+      - name: Install musl tools (Linux x86_64)
+        if: matrix.target == 'x86_64-unknown-linux-musl'
+        run: sudo apt-get update && sudo apt-get install -y musl-tools
+
+      - name: Build binaries (native)
+        if: !matrix.use_cross
+        run: |
+          cargo build --release --locked --target ${{ matrix.target }}
+
+      - name: Build binaries (cross)
+        if: matrix.use_cross
+        uses: houseabsolute/actions-rust-cross@v1
+        with:
+          command: build
+          target: ${{ matrix.target }}
+          args: --release --locked
+
+      - name: Package release assets
+        shell: bash
+        run: |
+          TAG_NAME="${GITHUB_REF#refs/tags/}"
+          ARCHIVE_NAME="lightrail-${TAG_NAME}-${{ matrix.target }}"
+          LATEST_ARCHIVE_NAME="lightrail-${{ matrix.target }}"
+          BUILD_DIR="target/${{ matrix.target }}/release"
+          PKG_DIR="dist/${ARCHIVE_NAME}"
+
+          mkdir -p "${PKG_DIR}"
+          cp "${BUILD_DIR}/lightrail" "${PKG_DIR}/"
+          cp "${BUILD_DIR}/lightrail-plugin-compose" "${PKG_DIR}/"
+          cp "${BUILD_DIR}/lightrail-plugin-fly" "${PKG_DIR}/"
+          cp "${BUILD_DIR}/lightrail-plugin-hetzner" "${PKG_DIR}/"
+          cp "${BUILD_DIR}/lightrail-plugin-kubernetes" "${PKG_DIR}/"
+          cp "${BUILD_DIR}/lightrail-plugin-ssh" "${PKG_DIR}/"
+          cp README.md LICENSE "${PKG_DIR}/" || true
+
+          mkdir -p release_artifacts
+          tar -czf "release_artifacts/${ARCHIVE_NAME}.tar.gz" -C "${PKG_DIR}" .
+          cp "release_artifacts/${ARCHIVE_NAME}.tar.gz" "release_artifacts/${LATEST_ARCHIVE_NAME}.tar.gz"
+
+          cd release_artifacts
+          if command -v sha256sum >/dev/null 2>&1; then
+            sha256sum "${ARCHIVE_NAME}.tar.gz" > "${ARCHIVE_NAME}.tar.gz.sha256"
+          else
+            shasum -a 256 "${ARCHIVE_NAME}.tar.gz" > "${ARCHIVE_NAME}.tar.gz.sha256"
+          fi
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-${{ matrix.target }}
+          path: release_artifacts/*
+
+  publish-release:
+    name: Create GitHub Release
+    needs: build-release
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Download all build artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: all_artifacts
+
+      - name: Organize release files
+        run: |
+          mkdir -p upload_files
+          find all_artifacts -type f \( -name "*.tar.gz" -o -name "*.sha256" \) -exec cp {} upload_files/ \;
+          ls -la upload_files/
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: upload_files/*
+          draft: false
+          prerelease: false
+          generate_release_notes: true

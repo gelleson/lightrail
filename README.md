@@ -111,6 +111,22 @@ control plane.
 
 ## Getting started
 
+### Quick Installation (One-liner)
+
+Install the CLI and all bundled plugins into `~/.local/bin` using the bash installer:
+
+```console
+curl -fsSL https://raw.githubusercontent.com/gelleson/lightrail/main/install.sh | sh
+```
+
+You can customize the destination or target version using environment variables:
+
+```console
+PREFIX=/usr/local VERSION=v0.1.0 curl -fsSL https://raw.githubusercontent.com/gelleson/lightrail/main/install.sh | sh
+```
+
+### Building from source
+
 The workspace requires Rust 1.85 or newer. Common runtime prerequisites are
 Git and Docker with Compose and Buildx. SSH/Hetzner also require an
 OpenSSH-compatible client; Kubernetes requires `kubectl` and access to the
@@ -122,6 +138,7 @@ Build the CLI and all five bundled plugin executables:
 cargo build --workspace
 target/debug/lightrail doctor
 ```
+
 
 Place `target/debug` on `PATH`, or use absolute paths to `lightrail` and its
 sibling plugin executables when running it from another repository.
@@ -506,9 +523,12 @@ See [the product specification](docs/product-spec.md),
 ```console
 make help
 make check
+make build-fast       # Fast optimized compilation profile
+make static           # Fully static binary build (crt-static)
+make release V=1      # Verbose release build
 ```
 
 The Makefile builds and tests the CLI plus every bundled plugin; plain Cargo
 workspace commands do the same. See [CONTRIBUTING.md](CONTRIBUTING.md) for the
-human workflow and [AGENTS.md](AGENTS.md) for the project map and invariants
-used by coding agents.
+human workflow, fast/static build options, release tagging cycle, and
+[AGENTS.md](AGENTS.md) for the project map and invariants used by coding agents.

@@ -26,8 +26,26 @@ make run ARGS="doctor"
 ```
 
 To install optimized binaries together under `~/.local/bin`, run
-`make install`. Override the destination with `PREFIX`, for example
-`make install PREFIX=/usr/local`.
+`make install` or `./install.sh`. Override the destination with `PREFIX`, for example
+`make install PREFIX=/usr/local` or `PREFIX=/usr/local ./install.sh`.
+
+### Fast & Static Build Options
+
+Lightrail Makefile and Cargo setup support fast compilation profiles, static linking, and verbose diagnostic output:
+
+- **Fast Build**: `make build-fast` uses the `release-fast` profile for quick iteration with optimizations.
+- **Static Linking**: `make static` (or `STATIC=1 make release`) builds fully static binaries using `-C target-feature=+crt-static` (e.g. `x86_64-unknown-linux-musl`).
+- **Verbose Output**: `V=1` (e.g. `make build V=1` or `make static V=1`) passes `-v` to Cargo commands.
+
+### Release Cycle
+
+Lightrail releases are automated via GitHub Actions (`.github/workflows/release.yml`):
+
+1. Ensure `make check` and tests pass cleanly on `main`.
+2. Tag the release: `git tag v0.1.0`.
+3. Push tag to GitHub: `git push origin v0.1.0`.
+4. CI cross-compiles static Linux (musl x86_64 / aarch64) and macOS binaries, packages tarballs with SHA256 checksums, and publishes the GitHub Release.
+
 
 ## Repository layout
 

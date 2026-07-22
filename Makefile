@@ -9,16 +9,33 @@ export CARGO_TARGET_DIR
 
 DEBUG_DIR := $(CARGO_TARGET_DIR)/debug
 RELEASE_DIR := $(CARGO_TARGET_DIR)/release
+RELEASE_FAST_DIR := $(CARGO_TARGET_DIR)/release-fast
+
+V ?= 0
+VERBOSE_FLAG :=
+ifneq ($(V),0)
+    VERBOSE_FLAG := -v
+endif
+
+STATIC ?= 0
+ifneq ($(STATIC),0)
+    export RUSTFLAGS := $(RUSTFLAGS) -C target-feature=+crt-static
+endif
+
+CARGO_FLAGS ?=
 
 .DEFAULT_GOAL := help
 .NOTPARALLEL: check
 
-.PHONY: help build release run doctor test lint fmt fmt-check examples check install
+.PHONY: help build build-fast release release-fast static release-static run doctor test lint fmt fmt-check examples check install
 
 help:
 	@printf '%s\n' \
 		'Common development commands:' \
 		'  make build          Build the CLI and every bundled plugin' \
+		'  make build-fast     Build optimized binaries using fast release profile' \
+		'  make release        Build fully optimized release binaries' \
+		'  make static         Build static release binaries (crt-static)' \
 		'  make run ARGS="..." Build, then run the development CLI' \
 		'  make doctor         Build, then check local prerequisites' \
 		'  make test           Test the complete workspace' \
@@ -27,14 +44,28 @@ help:
 		'  make fmt-check      Check formatting without changing files' \
 		'  make examples       Validate both Compose examples' \
 		'  make check          Run the full local verification gate' \
-		'  make release        Build optimized binaries' \
-		'  make install        Install release binaries under PREFIX/bin'
+		'  make install        Install release binaries under PREFIX/bin' \
+		'' \
+		'Options:' \
+		'  V=1                 Verbose build output (-v)' \
+		'  STATIC=1            Enable static linking' \
+		'  PREFIX=/path        Installation directory (default: ~/.local)'
 
 build:
-	$(CARGO) build --workspace --locked
+	$(CARGO) build $(VERBOSE_FLAG) $(CARGO_FLAGS) --workspace --locked
+
+build-fast:
+	$(CARGO) build $(VERBOSE_FLAG) $(CARGO_FLAGS) --workspace --locked --profile release-fast
 
 release:
-	$(CARGO) build --release --workspace --locked
+	$(CARGO) build $(VERBOSE_FLAG) $(CARGO_FLAGS) --release --workspace --locked
+
+release-fast: build-fast
+
+static:
+	RUSTFLAGS="$(RUSTFLAGS) -C target-feature=+crt-static" $(CARGO) build $(VERBOSE_FLAG) $(CARGO_FLAGS) --release --workspace --locked
+
+release-static: static
 
 run: build
 	$(DEBUG_DIR)/lightrail $(ARGS)
@@ -43,10 +74,10 @@ doctor: build
 	$(DEBUG_DIR)/lightrail doctor
 
 test:
-	$(CARGO) test --workspace --locked
+	$(CARGO) test $(VERBOSE_FLAG) $(CARGO_FLAGS) --workspace --locked
 
 lint:
-	$(CARGO) clippy --workspace --all-targets --all-features --locked -- -D warnings
+	$(CARGO) clippy $(VERBOSE_FLAG) $(CARGO_FLAGS) --workspace --all-targets --all-features --locked -- -D warnings
 
 fmt:
 	$(CARGO) fmt --all
