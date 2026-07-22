@@ -1,12 +1,19 @@
 //! Current-checkout discovery through the external `git` executable.
 
 use std::ffi::OsStr;
+use std::io::{self, Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
-use std::process::{Command, Output};
+use std::process::{Command, Output, Stdio};
+use std::thread;
+use std::time::{Duration, Instant};
 
 use serde::Serialize;
 
 use crate::error::GitError;
+
+const GIT_COMMAND_TIMEOUT: Duration = Duration::from_secs(30);
+const GIT_WAIT_INTERVAL: Duration = Duration::from_millis(10);
+const GIT_CLEANUP_TIMEOUT: Duration = Duration::from_secs(2);
 
 /// Git state that affects source selection and environment naming.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -165,18 +172,142 @@ where
     I: IntoIterator<Item = S>,
     S: AsRef<OsStr>,
 {
-    Command::new("git")
+    let mut command = Command::new("git");
+    command
         .arg("-C")
         .arg(directory)
         .args(arguments)
-        .output()
-        .map_err(|source| {
-            if source.kind() == std::io::ErrorKind::NotFound {
-                GitError::Unavailable(source)
-            } else {
-                GitError::CommandIo { operation, source }
+        .stdin(Stdio::null())
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .env("GIT_OPTIONAL_LOCKS", "0");
+    run_git_command(&mut command, operation, GIT_COMMAND_TIMEOUT)
+}
+
+fn run_git_command(
+    command: &mut Command,
+    operation: &'static str,
+    timeout: Duration,
+) -> Result<Output, GitError> {
+    let deadline = Instant::now()
+        .checked_add(timeout)
+        .ok_or_else(|| GitError::TimedOut {
+            operation,
+            timeout,
+            cleanup: String::new(),
+        })?;
+    let mut stdout =
+        tempfile::tempfile().map_err(|source| GitError::CommandIo { operation, source })?;
+    let mut stderr =
+        tempfile::tempfile().map_err(|source| GitError::CommandIo { operation, source })?;
+    command
+        .stdout(Stdio::from(
+            stdout
+                .try_clone()
+                .map_err(|source| GitError::CommandIo { operation, source })?,
+        ))
+        .stderr(Stdio::from(
+            stderr
+                .try_clone()
+                .map_err(|source| GitError::CommandIo { operation, source })?,
+        ));
+
+    let mut child = command.spawn().map_err(|source| {
+        if source.kind() == std::io::ErrorKind::NotFound {
+            GitError::Unavailable(source)
+        } else {
+            GitError::CommandIo { operation, source }
+        }
+    })?;
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break status,
+            Ok(None) if Instant::now() >= deadline => {
+                return Err(terminate_timed_out_git(&mut child, operation, timeout));
             }
+            Ok(None) => {
+                let remaining = deadline.saturating_duration_since(Instant::now());
+                thread::sleep(GIT_WAIT_INTERVAL.min(remaining));
+            }
+            Err(source) => {
+                let cleanup = terminate_git(&mut child);
+                let source = match cleanup {
+                    None => source,
+                    Some(cleanup) => io::Error::new(
+                        source.kind(),
+                        format!("{source}; process cleanup also failed: {cleanup}"),
+                    ),
+                };
+                return Err(GitError::CommandIo { operation, source });
+            }
+        }
+    };
+
+    let stdout = read_captured_output(&mut stdout, operation)?;
+    let stderr = read_captured_output(&mut stderr, operation)?;
+    Ok(Output {
+        status,
+        stdout,
+        stderr,
+    })
+}
+
+fn terminate_timed_out_git(
+    child: &mut std::process::Child,
+    operation: &'static str,
+    timeout: Duration,
+) -> GitError {
+    let cleanup = terminate_git(child).map_or_else(String::new, |error| {
+        format!("; process cleanup also failed: {error}")
+    });
+    GitError::TimedOut {
+        operation,
+        timeout,
+        cleanup,
+    }
+}
+
+fn terminate_git(child: &mut std::process::Child) -> Option<io::Error> {
+    let kill_error = child.kill().err();
+    let deadline = Instant::now() + GIT_CLEANUP_TIMEOUT;
+    loop {
+        match child.try_wait() {
+            Ok(Some(_)) => return kill_error,
+            Ok(None) if Instant::now() >= deadline => {
+                return Some(kill_error.unwrap_or_else(|| {
+                    io::Error::new(
+                        io::ErrorKind::TimedOut,
+                        "timed out while reaping terminated Git process",
+                    )
+                }));
+            }
+            Ok(None) => {
+                let remaining = deadline.saturating_duration_since(Instant::now());
+                thread::sleep(GIT_WAIT_INTERVAL.min(remaining));
+            }
+            Err(wait_error) => {
+                return Some(match kill_error {
+                    None => wait_error,
+                    Some(kill_error) => io::Error::new(
+                        wait_error.kind(),
+                        format!("kill failed: {kill_error}; reap failed: {wait_error}"),
+                    ),
+                });
+            }
+        }
+    }
+}
+
+fn read_captured_output(
+    output: &mut std::fs::File,
+    operation: &'static str,
+) -> Result<Vec<u8>, GitError> {
+    output
+        .seek(SeekFrom::Start(0))
+        .and_then(|_| {
+            let mut bytes = Vec::new();
+            output.read_to_end(&mut bytes).map(|_| bytes)
         })
+        .map_err(|source| GitError::CommandIo { operation, source })
 }
 
 fn required_stdout(output: Output, operation: &'static str) -> Result<String, GitError> {
@@ -213,6 +344,9 @@ mod tests {
     use tempfile::TempDir;
 
     use super::*;
+
+    #[cfg(target_os = "linux")]
+    use std::ffi::OsString;
 
     fn git(directory: &Path, arguments: &[&str]) -> String {
         let output = Command::new("git")
@@ -289,5 +423,44 @@ mod tests {
         let error = GitContext::discover(temp.path()).expect_err("not a repository");
 
         assert!(matches!(error, GitError::NotRepository { .. }));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn bounded_git_command_terminates_and_reaps_on_timeout() {
+        let temp = tempfile::tempdir().expect("temporary directory");
+        let pid_file = temp.path().join("git-command.pid");
+        let mut command = Command::new("sh");
+        command.args([
+            OsString::from("-c"),
+            OsString::from("echo $$ > \"$1\"; exec sleep 30"),
+            OsString::from("sh"),
+            pid_file.as_os_str().to_owned(),
+        ]);
+
+        let error = run_git_command(
+            &mut command,
+            "testing bounded Git execution",
+            Duration::from_millis(200),
+        )
+        .expect_err("the command must time out");
+        assert!(matches!(
+            error,
+            GitError::TimedOut {
+                operation: "testing bounded Git execution",
+                timeout,
+                ..
+            } if timeout == Duration::from_millis(200)
+        ));
+
+        let pid = fs::read_to_string(pid_file)
+            .expect("child publishes its PID")
+            .trim()
+            .parse::<u32>()
+            .expect("child PID");
+        assert!(
+            !PathBuf::from(format!("/proc/{pid}")).exists(),
+            "timed-out Git process {pid} was not reaped"
+        );
     }
 }

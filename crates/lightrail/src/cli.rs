@@ -7,9 +7,9 @@ use crate::{
     admin,
     commands::{init, profile},
     error::CliError,
-    orchestrator::{self, DownOptions, LogOptions, QueryOptions, UpOptions},
+    orchestrator::{self, DownOptions, LogOptions, PruneOptions, QueryOptions, UpOptions},
     output::{self, OutputFormat},
-    plugin_host::{HETZNER_PLUGIN_ID, SSH_PLUGIN_ID},
+    plugin_host::{FLY_PLUGIN_ID, HETZNER_PLUGIN_ID, KUBERNETES_PLUGIN_ID, SSH_PLUGIN_ID},
     project::LoadedProject,
     workspace::ProjectPaths,
 };
@@ -55,6 +55,8 @@ pub enum Command {
     Logs(LogsArgs),
     /// Destroy isolated resources for the current environment.
     Down(DownArgs),
+    /// Destroy expired environments visible through the selected profile.
+    Prune(PruneArgs),
     /// Validate local tools and optionally the configured target.
     Doctor(DoctorArgs),
     /// Manage secret values stored outside project configuration.
@@ -81,7 +83,7 @@ pub struct InitArgs {
     #[arg(long, value_enum)]
     pub target: Option<init::TargetKind>,
 
-    /// Select the supported IP-DNS service.
+    /// Select IP-DNS for SSH, Hetzner, or Kubernetes; Fly uses fly.dev.
     #[arg(
         long,
         value_name = "DOMAIN",
@@ -184,6 +186,21 @@ pub struct DownArgs {
     pub force: bool,
 
     /// Maximum time to wait for the environment mutation lock.
+    #[arg(long, default_value = "30s", value_parser = parse_duration)]
+    pub lock_timeout: Duration,
+}
+
+#[derive(Debug, Args)]
+pub struct PruneArgs {
+    /// Print the exact expired-environment plan without changing resources.
+    #[arg(short = 'n', long)]
+    pub dry_run: bool,
+
+    /// Skip the interactive confirmation.
+    #[arg(short = 'y', long)]
+    pub yes: bool,
+
+    /// Maximum time to wait for the project mutation lock.
     #[arg(long, default_value = "30s", value_parser = parse_duration)]
     pub lock_timeout: Duration,
 }
@@ -444,6 +461,19 @@ pub async fn dispatch(cli: Cli) -> Result<(), CliError> {
             )
             .await
         }
+        Command::Prune(arguments) => {
+            let project = LoadedProject::discover(selected_profile.as_deref())?;
+            orchestrator::prune(
+                project,
+                PruneOptions {
+                    dry_run: arguments.dry_run,
+                    yes: arguments.yes,
+                    lock_timeout: arguments.lock_timeout,
+                    output: format,
+                },
+            )
+            .await
+        }
         Command::Doctor(arguments) => {
             let report =
                 admin::doctor(format, arguments.target, selected_profile.as_deref()).await?;
@@ -476,17 +506,46 @@ fn print_init_summary(summary: &init::InitSummary, format: OutputFormat) -> Resu
             if let Some(detail) = &summary.target_detail {
                 output::line(format!("           {detail}"))?;
             }
-            output::line(format!("  dns      {} (hex IPv4)", summary.dns_domain))?;
+            match summary.target {
+                init::TargetKind::Fly => {
+                    output::line(format!(
+                        "  dns      {} (provider native)",
+                        summary.dns_domain
+                    ))?;
+                }
+                init::TargetKind::Kubernetes => {
+                    output::line(format!(
+                        "  dns      {} (ingress IPv4 encoded as hex)",
+                        summary.dns_domain
+                    ))?;
+                }
+                init::TargetKind::Ssh | init::TargetKind::Hetzner => {
+                    output::line(format!("  dns      {} (hex IPv4)", summary.dns_domain))?;
+                }
+            }
             output::line("  apps")?;
             for app in &summary.apps {
                 output::line(format!("    {:<16} {}:{}", app.name, app.service, app.port))?;
             }
             output::line("")?;
             output::line("Next: lightrail up --dry-run")?;
-            if summary.target == init::TargetKind::Hetzner {
-                output::line(
-                    "  `up` asks once for `hetzner-token`; run `lightrail secret set hetzner-token` to store it for reuse.",
-                )?;
+            match summary.target {
+                init::TargetKind::Hetzner => {
+                    output::line(
+                        "  `up` asks once for `hetzner-token`; run `lightrail secret set hetzner-token` to store it for reuse.",
+                    )?;
+                }
+                init::TargetKind::Fly => {
+                    output::line(
+                        "  `up` asks once for `fly-token`; run `lightrail secret set fly-token` to store it for reuse.",
+                    )?;
+                }
+                init::TargetKind::Kubernetes => {
+                    output::line(
+                        "  Ensure the control namespace, IngressClass, ClusterIssuer, and optional image-pull Secret already exist.",
+                    )?;
+                }
+                init::TargetKind::Ssh => {}
             }
             output::line("  Then deploy: lightrail up")
         }
@@ -496,6 +555,7 @@ fn print_init_summary(summary: &init::InitSummary, format: OutputFormat) -> Resu
 const fn isolation_name(isolation: lightrail_core::Isolation) -> &'static str {
     match isolation {
         lightrail_core::Isolation::Project => "project",
+        lightrail_core::Isolation::Environment => "environment",
         lightrail_core::Isolation::Machine => "machine",
     }
 }
@@ -504,6 +564,8 @@ fn target_name(plugin_id: &str) -> &str {
     match plugin_id {
         SSH_PLUGIN_ID => "Generic SSH host",
         HETZNER_PLUGIN_ID => "Hetzner Cloud",
+        KUBERNETES_PLUGIN_ID => "Kubernetes",
+        FLY_PLUGIN_ID => "Fly.io",
         other => other,
     }
 }
@@ -586,6 +648,23 @@ mod tests {
             try_parse_from(["lightrail", "init", "--domain", "example.com"]).is_err(),
             "custom DNS providers are intentionally unsupported"
         );
+        let kubernetes =
+            try_parse_from(["lightrail", "init", "--target", "kubernetes"]).expect("Kubernetes");
+        assert!(matches!(
+            kubernetes.command,
+            Command::Init(InitArgs {
+                target: Some(init::TargetKind::Kubernetes),
+                ..
+            })
+        ));
+        let fly = try_parse_from(["lightrail", "init", "--target", "fly"]).expect("Fly");
+        assert!(matches!(
+            fly.command,
+            Command::Init(InitArgs {
+                target: Some(init::TargetKind::Fly),
+                ..
+            })
+        ));
     }
 
     #[test]
@@ -599,6 +678,27 @@ mod tests {
             panic!("expected up");
         };
         assert!(up.dry_run);
+    }
+
+    #[test]
+    fn parses_safe_prune_options() {
+        let cli = try_parse_from([
+            "lightrail",
+            "--profile",
+            "preview",
+            "prune",
+            "--dry-run",
+            "--lock-timeout",
+            "2m",
+        ])
+        .expect("prune");
+        let Command::Prune(prune) = cli.command else {
+            panic!("expected prune");
+        };
+
+        assert!(prune.dry_run);
+        assert!(!prune.yes);
+        assert_eq!(prune.lock_timeout, Duration::from_secs(120));
     }
 
     #[test]

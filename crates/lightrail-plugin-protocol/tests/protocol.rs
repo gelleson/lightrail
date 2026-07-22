@@ -3,9 +3,10 @@ use std::time::Duration;
 use async_trait::async_trait;
 use lightrail_plugin_protocol::{
     Capability, ClientError, ClientEvent, ClientOptions, Diagnostic, DiagnosticSeverity, Empty,
-    EventSink, ExecutableMetadata, InitializeRequest, OperationContext, PluginEvent, PluginHandler,
-    PluginManifest, PluginResult, ProtocolCompatibility, ProtocolRequirement, ProtocolVersion,
-    SecretValue, ValidateRequest, ValidateResult, serve,
+    EventSink, ExecutableMetadata, InitializeRequest, MAX_OPERATION_REQUEST_TIMEOUT,
+    OperationContext, PluginEvent, PluginHandler, PluginManifest, PluginResult,
+    ProtocolCompatibility, ProtocolRequirement, ProtocolVersion, SecretValue, ValidateRequest,
+    ValidateResult, operation_request_timeout, serve,
 };
 use serde_json::json;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader, duplex, split};
@@ -38,6 +39,7 @@ impl PluginHandler for TestHandler {
             },
             executable: ExecutableMetadata::default(),
             capabilities: vec![Capability::Other("test-echo".to_owned())],
+            features: Vec::new(),
             required_secrets: Vec::new(),
             config_schema: json!({"type": "object"}),
             config_ui_hints: json!({}),
@@ -90,6 +92,61 @@ fn request() -> ValidateRequest {
     }
 }
 
+#[test]
+fn manifest_without_features_remains_compatible() {
+    let mut value =
+        serde_json::to_value(TestHandler::current().manifest()).expect("manifest should serialize");
+    value
+        .as_object_mut()
+        .expect("manifest should be an object")
+        .remove("features");
+
+    let manifest: PluginManifest =
+        serde_json::from_value(value).expect("older manifest should deserialize");
+
+    assert!(manifest.features.is_empty());
+}
+
+#[test]
+fn default_request_timeout_is_the_fallback_for_short_protocol_calls() {
+    assert_eq!(
+        ClientOptions::default().request_timeout,
+        Duration::from_secs(125 * 60)
+    );
+}
+
+#[test]
+fn operation_timeout_uses_exact_units_and_configured_phase_budgets() {
+    let context = OperationContext {
+        config: json!({
+            "command_timeout_seconds": 3_600,
+            "readiness_timeout_seconds": 3_000,
+        }),
+        ..OperationContext::default()
+    };
+
+    assert_eq!(
+        operation_request_timeout(&context, 3),
+        Duration::from_secs((3_600 + 3_000) * 3 + 300)
+    );
+}
+
+#[test]
+fn operation_timeout_saturates_at_the_explicit_request_ceiling() {
+    let context = OperationContext {
+        config: json!({
+            "command_timeout_seconds": u64::MAX,
+            "readiness_timeout_seconds": u64::MAX,
+        }),
+        ..OperationContext::default()
+    };
+
+    assert_eq!(
+        operation_request_timeout(&context, usize::MAX),
+        MAX_OPERATION_REQUEST_TIMEOUT
+    );
+}
+
 fn connected(
     handler: TestHandler,
     timeout: Duration,
@@ -123,6 +180,7 @@ async fn request_response_and_notification_round_trip() {
         .await
         .expect("protocol should negotiate");
     assert_eq!(initialized.manifest.id, "io.lightrail.test");
+    assert!(initialized.manifest.features.is_empty());
 
     let result = client
         .validate(request())
@@ -220,7 +278,7 @@ async fn timeout_cancels_the_rpc_request() {
     };
     let (client, server) = connected(handler, Duration::from_millis(30));
     let error = client
-        .validate(request())
+        .validate_with_timeout(request(), Duration::from_millis(30))
         .await
         .expect_err("slow response must time out");
     assert!(matches!(error, ClientError::Timeout { .. }));
@@ -231,6 +289,56 @@ async fn timeout_cancels_the_rpc_request() {
         .await
         .expect("server task should join")
         .expect("serve");
+}
+
+#[tokio::test]
+async fn call_specific_timeout_sends_the_standard_cancellation_notification() {
+    let (client_stream, plugin_stream) = duplex(16 * 1024);
+    let (client_reader, client_writer) = split(client_stream);
+    let (plugin_reader, plugin_writer) = split(plugin_stream);
+    let client = lightrail_plugin_protocol::PluginClient::connect_io(
+        client_reader,
+        client_writer,
+        ClientOptions {
+            request_timeout: Duration::from_secs(1),
+            ..ClientOptions::default()
+        },
+    );
+
+    let fake_plugin = tokio::spawn(async move {
+        let mut reader = BufReader::new(plugin_reader);
+        let mut request_line = String::new();
+        reader
+            .read_line(&mut request_line)
+            .await
+            .expect("read request");
+        let request: serde_json::Value = serde_json::from_str(&request_line).expect("request JSON");
+
+        let mut cancellation_line = String::new();
+        reader
+            .read_line(&mut cancellation_line)
+            .await
+            .expect("read cancellation");
+        let cancellation: serde_json::Value =
+            serde_json::from_str(&cancellation_line).expect("cancellation JSON");
+        assert_eq!(cancellation["method"], "$/cancelRequest");
+        assert_eq!(cancellation["params"]["id"], request["id"]);
+        drop(plugin_writer);
+    });
+
+    let timeout = Duration::from_millis(30);
+    let error = client
+        .request_with_timeout::<_, Empty>("test.slow", &Empty {}, timeout)
+        .await
+        .expect_err("unanswered request must time out");
+    assert!(matches!(
+        error,
+        ClientError::Timeout {
+            timeout: actual,
+            ..
+        } if actual == timeout
+    ));
+    fake_plugin.await.expect("fake plugin joins");
 }
 
 #[tokio::test]

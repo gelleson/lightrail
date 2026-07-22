@@ -24,16 +24,21 @@ product documentation.
   ignore dirty build-context files.
 - Environment identity derives from project UUID, profile, and raw branch.
   Commit and dirty state affect the deployment revision, not environment
-  identity.
-- Public hostnames remain
+  identity. Local builds, resolved environment material, and file-backed
+  assets may conservatively make a revision operation-scoped when their bytes
+  cannot be represented safely and completely in provider-visible metadata.
+- SSH/Hetzner and IP-addressed Kubernetes ingress hostnames remain
   `<branch>.<app>.<profile>.<project>.<8-hex-ip>.{sslip.io,nip.io}`. Branch
-  comes before app. No other DNS suffix is supported.
+  comes before app. Fly uses one provider-native `<owned-app>.fly.dev`
+  hostname per public app.
 - Runtimes are remote. Literal localhost, loopback IPs, and hostnames resolving
-  to loopback must fail before SSH.
-- Public apps use trusted HTTPS through Traefik and ACME HTTP-01; HTTP
-  redirects to HTTPS.
-- Only selected public apps join the ingress network. Other services stay
-  private, and app ports are never published directly on the host.
+  to loopback must fail during provider preflight, before mutation.
+- Public apps use trusted HTTPS. SSH/Hetzner use Traefik and ACME HTTP-01;
+  Kubernetes uses the selected existing IngressClass and cert-manager
+  ClusterIssuer; Fly uses Fly Proxy and its native certificates. HTTP
+  redirects to HTTPS on every provider.
+- Only selected apps receive public routes. Other services stay private, and
+  app ports are never published directly on a host.
 - Core stays provider-independent. Infrastructure behavior belongs behind the
   versioned executable-plugin boundary.
 - Plugin stdout is protocol-only newline-delimited JSON-RPC. Diagnostics go to
@@ -47,17 +52,43 @@ product documentation.
   generated artifacts.
 - A mutation follows inspect, ownership-scoped plan, authoritative lock,
   reinspection/continuity check, exact-plan apply, journal, and lock release.
+- Every provider action that may mutate declares a supported exact inverse or
+  `supported = false` with a safe reason. Omit rollback metadata only for
+  genuinely side-effect-free work; retained Builder artifacts still declare
+  their unsupported inverse explicitly.
 - Failed `up` rolls back unless explicitly told to preserve resources.
   Destruction is confirmed, ownership-scoped, and idempotent.
+- Kubernetes `up` is non-destructive: stale owned resources, new runtime
+  resources on an established revision, and changed immutable Jobs require
+  explicit `down` followed by `up`. Existing Traefik entrypoint names come
+  from profile settings (`web`/`websecure` defaults); never rewrite the shared
+  controller.
+- Fly reconciles an existing service set in place, but adding or removing a
+  Compose service changes the owned App aggregate and requires explicit
+  `down` followed by `up`. Changes to named-volume topology, requested volume
+  size, Machine region, or public-to-private exposure have the same boundary.
+  Existing Machine updates have no exact automatic previous-revision inverse
+  and must report rollback-incomplete on failure.
+  Autostop/autostart applies only to Proxy-backed public services; private
+  service Machines remain running under their restart policy.
 - `down --force` is unavailable-lock recovery for machine-isolated provider
   deletion only. It never bypasses a busy lock or ownership checks.
 - Generic SSH hosts and shared Traefik are retained during environment
-  teardown. A Hetzner environment owns its machine and firewall; public web
-  ingress is limited to 80/443 and SSH to configured operator CIDRs.
+  teardown. A Hetzner environment owns its machine and firewall. Kubernetes
+  environments own namespaces but not clusters or shared ingress/cert
+  controllers. Fly environments own exact Apps, Machines, volumes, and
+  App-attached address/routing state; their custom 6PN name is not a separately
+  deleted resource. Public web ingress is limited to 80/443 and SSH to
+  configured operator CIDRs.
 - Preserve cancellation, bounded subprocesses, kill-on-drop behavior,
   stdout/stderr separation, machine-readable output, and stable exit meaning.
-- Usage reporting, tunnels, PR automation, Fly.io, Kubernetes, k3s, custom
-  DNS, remote exec, and native Windows remain deferred unless requested.
+- Kubernetes and Fly expiry defaults to 72 hours of provider-visible metadata,
+  refreshed only by successful `up`. Cleanup requires explicit, feature-gated,
+  exact-selection `prune`; there is no janitor. Pushed OCI images remain
+  registry-managed cache after rollback, `down`, and `prune`.
+- Usage reporting, tunnels, PR automation, cluster provisioning, shared
+  Kubernetes setup, a background expiry janitor, custom DNS, remote exec, and
+  native Windows remain deferred unless requested.
 
 ## Repository map
 
@@ -77,6 +108,8 @@ product documentation.
 | Compose/build/Traefik | `plugins/lightrail-plugin-compose/src/` |
 | Generic SSH target | `plugins/lightrail-plugin-ssh/src/lib.rs`, `remote/` |
 | Hetzner target | `plugins/lightrail-plugin-hetzner/src/{model,api,ssh,plugin}.rs` |
+| Existing Kubernetes target | `plugins/lightrail-plugin-kubernetes/README.md`, then `src/` |
+| Fly.io target | `plugins/lightrail-plugin-fly/README.md`, then `src/` |
 
 The orchestrator owns ordering, retries, locks, journals, rollback, and
 cross-plugin invariants. Plugins validate and execute capability-specific
@@ -109,6 +142,8 @@ Minimum test selection:
 | Compose/build/runtime | `cargo test -p lightrail-plugin-compose --locked` |
 | Generic SSH | `cargo test -p lightrail-plugin-ssh --locked` |
 | Hetzner | `cargo test -p lightrail-plugin-hetzner --locked` |
+| Kubernetes | `cargo test -p lightrail-plugin-kubernetes --locked` |
+| Fly.io | `cargo test -p lightrail-plugin-fly --locked` |
 | Cross-cutting or release | `make check` |
 
 Tests should not require real provider credentials or mutate live

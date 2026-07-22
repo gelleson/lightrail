@@ -45,7 +45,13 @@ impl<R: CommandRunner> Doctor<R> {
     }
 
     pub async fn local(&self) -> DoctorReport {
-        let specifications = [
+        self.local_for(None).await
+    }
+
+    /// Checks the common local tools plus those needed by one configured
+    /// target. `None` is the provider-neutral pre-initialization check.
+    pub async fn local_for(&self, target_plugin: Option<&str>) -> DoctorReport {
+        let mut specifications = vec![
             (
                 "git",
                 CommandSpec::new("git").args(["--version"]),
@@ -71,12 +77,10 @@ impl<R: CommandRunner> Doctor<R> {
                 CommandSpec::new("docker").args(["compose", "version", "--short"]),
                 "Install or enable the Docker Compose plugin.",
             ),
-            (
-                "ssh",
-                CommandSpec::new("ssh").args(["-V"]),
-                "Install an OpenSSH-compatible client.",
-            ),
         ];
+        if let Some(target) = target_specific_check(target_plugin) {
+            specifications.push(target);
+        }
         let mut checks = Vec::with_capacity(specifications.len());
         for (name, specification, remediation) in specifications {
             let check = match self.runner.run(&specification).await {
@@ -105,6 +109,24 @@ impl<R: CommandRunner> Doctor<R> {
     }
 }
 
+fn target_specific_check(
+    target_plugin: Option<&str>,
+) -> Option<(&'static str, CommandSpec, &'static str)> {
+    match target_plugin {
+        Some(crate::plugin_host::KUBERNETES_PLUGIN_ID) => Some((
+            "kubectl",
+            CommandSpec::new("kubectl").args(["version", "--client"]),
+            "Install kubectl and ensure it is on PATH.",
+        )),
+        Some(crate::plugin_host::SSH_PLUGIN_ID | crate::plugin_host::HETZNER_PLUGIN_ID) => Some((
+            "ssh",
+            CommandSpec::new("ssh").args(["-V"]),
+            "Install an OpenSSH-compatible client.",
+        )),
+        None | Some(_) => None,
+    }
+}
+
 pub fn ensure_healthy(report: &DoctorReport) -> Result<(), CliError> {
     if report.healthy() {
         Ok(())
@@ -120,5 +142,26 @@ pub fn ensure_healthy(report: &DoctorReport) -> Result<(), CliError> {
             failed.len(),
             failed.join(", "),
         )))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::target_specific_check;
+    use crate::plugin_host::{
+        FLY_PLUGIN_ID, HETZNER_PLUGIN_ID, KUBERNETES_PLUGIN_ID, SSH_PLUGIN_ID,
+    };
+
+    fn selected_tool(plugin: Option<&str>) -> Option<&'static str> {
+        target_specific_check(plugin).map(|(name, _, _)| name)
+    }
+
+    #[test]
+    fn target_tool_checks_are_selected_only_after_initialization() {
+        assert_eq!(selected_tool(None), None);
+        assert_eq!(selected_tool(Some(FLY_PLUGIN_ID)), None);
+        assert_eq!(selected_tool(Some(KUBERNETES_PLUGIN_ID)), Some("kubectl"));
+        assert_eq!(selected_tool(Some(SSH_PLUGIN_ID)), Some("ssh"));
+        assert_eq!(selected_tool(Some(HETZNER_PLUGIN_ID)), Some("ssh"));
     }
 }

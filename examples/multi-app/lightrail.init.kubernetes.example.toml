@@ -1,0 +1,31 @@
+project_slug = "multi-example"
+compose = ["compose.yaml"]
+target = "kubernetes"
+isolation = "environment"
+dns_domain = "nip.io"
+
+[[apps]]
+name = "frontend"
+service = "frontend"
+port = 8080
+health_path = "/health"
+health_status = 200
+
+[[apps]]
+name = "api"
+service = "api"
+port = 8080
+health_path = "/health"
+health_status = 200
+
+[settings.target]
+context = "rackspace-spot"
+registry = "ghcr.io"
+repository = "your-org/lightrail"
+ingress_class = "nginx"
+# Replace these placeholders with the exact LoadBalancer Service backing that class.
+ingress_service_namespace = "ingress-nginx"
+ingress_service_name = "ingress-nginx-controller"
+control_namespace = "lightrail-system"
+cluster_issuer = "letsencrypt"
+ttl_hours = 72

@@ -294,6 +294,8 @@ pub struct SecretReference {
 pub enum Isolation {
     /// Multiple environments share a host but have isolated Compose resources.
     Project,
+    /// Each environment owns a provider-native namespace or application boundary.
+    Environment,
     /// The environment owns a complete machine.
     Machine,
 }
@@ -443,7 +445,7 @@ pub struct App {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Profile {
-    /// Host or project isolation boundary.
+    /// Shared-project, provider-environment, or machine isolation boundary.
     pub isolation: Isolation,
     /// Public apps selected from the top-level app map.
     pub apps: Vec<String>,
@@ -1019,6 +1021,14 @@ DATABASE_URL = { secret = "preview-database-url" }
         let reparsed = LightrailConfig::parse(&serialized).expect("reparse");
 
         assert_eq!(reparsed, config);
+    }
+
+    #[test]
+    fn parses_provider_environment_isolation() {
+        let source = VALID_CONFIG.replace("isolation = \"machine\"", "isolation = \"environment\"");
+        let config = LightrailConfig::parse(&source).expect("environment isolation");
+
+        assert_eq!(config.profiles["preview"].isolation, Isolation::Environment);
     }
 
     #[test]

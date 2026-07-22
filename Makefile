@@ -67,6 +67,8 @@ install: release
 	install -m 0755 \
 		$(RELEASE_DIR)/lightrail \
 		$(RELEASE_DIR)/lightrail-plugin-compose \
+		$(RELEASE_DIR)/lightrail-plugin-fly \
 		$(RELEASE_DIR)/lightrail-plugin-hetzner \
+		$(RELEASE_DIR)/lightrail-plugin-kubernetes \
 		$(RELEASE_DIR)/lightrail-plugin-ssh \
 		"$(DESTDIR)$(PREFIX)/bin/"

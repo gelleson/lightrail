@@ -1,0 +1,16 @@
+project_slug = "single-example"
+compose = ["compose.yaml"]
+target = "fly"
+isolation = "environment"
+
+[[apps]]
+name = "hello"
+service = "web"
+port = 8080
+health_path = "/health"
+health_status = 200
+
+[settings.target]
+organization = "personal"
+# region = "ams" # omit to let Fly select
+ttl_hours = 72

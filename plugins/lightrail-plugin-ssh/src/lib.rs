@@ -20,7 +20,7 @@ use lightrail_plugin_protocol::{
     JournalStatus, LockAcquireRequest, LockAcquireResult, LockReleaseRequest, LockReleaseResult,
     LockScope, OperationContext, PlanRequest, PlanResult, PlannedAction, Platform, PluginError,
     PluginEvent, PluginHandler, PluginManifest, PluginResult, ProtocolCompatibility,
-    ResourceStatus, SecretValue, ValidateRequest, ValidateResult,
+    ResourceStatus, RollbackMetadata, SecretValue, ValidateRequest, ValidateResult,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -697,7 +697,7 @@ impl SshPlugin {
             .actions
             .iter()
             .any(|action| action.kind == "ssh.bootstrap");
-        if plan.plan_id != plan_id(settings, planned_bootstrap)?
+        if plan.plan_id != plan_id(settings, planned_bootstrap, &plan.actions)?
             || planned_bootstrap != action_has_bootstrap
         {
             return Err(PluginError::permanent(
@@ -754,6 +754,7 @@ impl PluginHandler for SshPlugin {
                 homepage: None,
             },
             capabilities: vec![Capability::Target, Capability::OperationLock],
+            features: Vec::new(),
             required_secrets: Vec::new(),
             config_schema: config_schema(),
             config_ui_hints: json!({
@@ -850,23 +851,11 @@ impl PluginHandler for SshPlugin {
         }
         let needs_bootstrap = !probe.runtime_ready(&settings);
         let actions = if needs_bootstrap {
-            vec![PlannedAction {
-                id: "bootstrap-remote".to_owned(),
-                kind: "ssh.bootstrap".to_owned(),
-                summary: "Install or verify Docker prerequisites and prepare remote_root"
-                    .to_owned(),
-                destructive: false,
-                depends_on: Vec::new(),
-                rollback: None,
-                metadata: json!({
-                    "bootstrap": settings.bootstrap,
-                    "remote_root": settings.remote_root,
-                }),
-            }]
+            vec![bootstrap_action(&settings)]
         } else {
             Vec::new()
         };
-        let plan_id = plan_id(&settings, needs_bootstrap)?;
+        let plan_id = plan_id(&settings, needs_bootstrap, &actions)?;
         Ok(PlanResult {
             plan_id,
             has_changes: !actions.is_empty(),
@@ -1700,11 +1689,16 @@ fn settings_digest(settings: &Settings) -> PluginResult<String> {
     Ok(hex::encode(Sha256::digest(encoded)))
 }
 
-fn plan_id(settings: &Settings, needs_bootstrap: bool) -> PluginResult<String> {
+fn plan_id(
+    settings: &Settings,
+    needs_bootstrap: bool,
+    actions: &[PlannedAction],
+) -> PluginResult<String> {
     let mut digest = Sha256::new();
-    digest.update(b"lightrail-ssh-plan-v1\0");
+    digest.update(b"lightrail-ssh-plan-v2\0");
     digest.update(settings_digest(settings)?.as_bytes());
     digest.update([u8::from(needs_bootstrap)]);
+    digest.update(serde_json::to_vec(actions).map_err(|error| serialization_error(&error))?);
     Ok(hex::encode(digest.finalize()))
 }
 
@@ -1755,6 +1749,28 @@ fn lock_script_for(timeout_ms: u64, lock_directory: &str) -> String {
          printf 'LIGHTRAIL_LOCKED\\n'; \
          while IFS= read -r keepalive; do :; done"
     )
+}
+
+fn bootstrap_action(settings: &Settings) -> PlannedAction {
+    PlannedAction {
+        id: "bootstrap-remote".to_owned(),
+        kind: "ssh.bootstrap".to_owned(),
+        summary: "Install or verify Docker prerequisites and prepare remote_root".to_owned(),
+        destructive: false,
+        depends_on: Vec::new(),
+        rollback: Some(RollbackMetadata {
+            supported: false,
+            action: None,
+            token: None,
+            metadata: json!({
+                "reason": "host package installation and shared prerequisite changes are intentionally retained"
+            }),
+        }),
+        metadata: json!({
+            "bootstrap": settings.bootstrap,
+            "remote_root": settings.remote_root,
+        }),
+    }
 }
 
 fn journal_entry(sequence: u64, status: JournalStatus, message: &str) -> ActionJournalEntry {
@@ -2014,6 +2030,21 @@ mod tests {
         assert_ne!(first, lock_scope(&other_host));
         assert_eq!(first.len(), 64);
         assert!(first.bytes().all(|byte| byte.is_ascii_hexdigit()));
+    }
+
+    #[test]
+    fn bootstrap_declares_intentionally_retained_rollback_limit() {
+        let rollback = bootstrap_action(&settings())
+            .rollback
+            .expect("bootstrap is a mutating action");
+        assert!(!rollback.supported);
+        assert!(
+            rollback
+                .metadata
+                .get("reason")
+                .and_then(Value::as_str)
+                .is_some_and(|reason| !reason.is_empty())
+        );
     }
 
     fn lock_request(operation_id: &str) -> LockAcquireRequest {

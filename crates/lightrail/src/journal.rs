@@ -12,6 +12,7 @@ use crate::error::CliError;
 pub enum OperationKind {
     Up,
     Down,
+    Prune,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -30,6 +31,12 @@ pub enum OperationStatus {
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct JournalAction {
     pub plugin_id: String,
+    /// Capability plan that owns this action. Missing only in legacy schema-1 journals.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub capability: Option<String>,
+    /// Exact plugin plan that owns this action. Missing only in legacy schema-1 journals.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub plan_id: Option<String>,
     pub action_id: String,
     pub summary: String,
     #[serde(default)]
@@ -94,6 +101,8 @@ mod tests {
         let mut journal = OperationJournal::new("env-1", OperationKind::Up);
         journal.actions.push(JournalAction {
             plugin_id: "test.plugin".into(),
+            capability: Some("runtime".into()),
+            plan_id: Some("plan-runtime".into()),
             action_id: "create".into(),
             summary: "create test resource".into(),
             public_metadata: serde_json::json!({"resource_id": "42"}),
@@ -104,5 +113,30 @@ mod tests {
         let decoded: OperationJournal =
             serde_json::from_slice(&tokio::fs::read(path).await.expect("read")).expect("decode");
         assert_eq!(decoded, journal);
+    }
+
+    #[test]
+    fn legacy_schema_one_actions_without_plan_scope_remain_readable() {
+        let legacy = serde_json::json!({
+            "schema": 1,
+            "operation_id": "49a59d24-1bea-4317-929a-c02c735f42d7",
+            "environment_id": "env-1",
+            "kind": "up",
+            "status": "failed",
+            "actions": [{
+                "plugin_id": "test.plugin",
+                "action_id": "create",
+                "summary": "create test resource",
+                "public_metadata": {},
+                "completed": false
+            }],
+            "error": "interrupted"
+        });
+
+        let journal: OperationJournal =
+            serde_json::from_value(legacy).expect("legacy schema-1 journal");
+
+        assert_eq!(journal.actions[0].capability, None);
+        assert_eq!(journal.actions[0].plan_id, None);
     }
 }

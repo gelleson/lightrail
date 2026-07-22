@@ -18,6 +18,8 @@ use crate::{
 pub const COMPOSE_PLUGIN_ID: &str = "dev.lightrail.compose";
 pub const SSH_PLUGIN_ID: &str = "dev.lightrail.ssh";
 pub const HETZNER_PLUGIN_ID: &str = "dev.lightrail.hetzner";
+pub const KUBERNETES_PLUGIN_ID: &str = "dev.lightrail.kubernetes";
+pub const FLY_PLUGIN_ID: &str = "dev.lightrail.fly";
 
 #[derive(Clone, Debug)]
 pub struct PluginLaunch {
@@ -186,6 +188,8 @@ fn bundled_executable(id: &str) -> Option<&'static str> {
         COMPOSE_PLUGIN_ID => Some("lightrail-plugin-compose"),
         SSH_PLUGIN_ID => Some("lightrail-plugin-ssh"),
         HETZNER_PLUGIN_ID => Some("lightrail-plugin-hetzner"),
+        KUBERNETES_PLUGIN_ID => Some("lightrail-plugin-kubernetes"),
+        FLY_PLUGIN_ID => Some("lightrail-plugin-fly"),
         _ => None,
     }
 }
@@ -282,6 +286,9 @@ fn sanitized_environment(plugin_id: &str) -> BTreeMap<OsString, OsString> {
     ) {
         copy_environment(&mut environment, "SSH_AUTH_SOCK");
     }
+    if plugin_id == KUBERNETES_PLUGIN_ID {
+        copy_environment(&mut environment, "KUBECONFIG");
+    }
     environment.insert(
         OsString::from("LIGHTRAIL_PLUGIN_PROTOCOL"),
         OsString::from(lightrail_plugin_protocol::PROTOCOL_VERSION_STRING),
@@ -306,6 +313,14 @@ mod tests {
         assert_eq!(
             bundled_executable(COMPOSE_PLUGIN_ID),
             Some("lightrail-plugin-compose")
+        );
+        assert_eq!(
+            bundled_executable(KUBERNETES_PLUGIN_ID),
+            Some("lightrail-plugin-kubernetes")
+        );
+        assert_eq!(
+            bundled_executable(FLY_PLUGIN_ID),
+            Some("lightrail-plugin-fly")
         );
         assert_eq!(bundled_executable("third.party"), None);
     }

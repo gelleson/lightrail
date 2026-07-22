@@ -27,7 +27,7 @@ use crate::{
         deployment_revision, endpoints, environment_ingress_network, ingress_compose,
         inspect_document,
     },
-    contract::{AppSpec, DesiredState, PluginConfig, TargetState},
+    contract::{AppSpec, DesiredState, PluginConfig, TargetState, canonical_project_source},
     error::ComposePluginError,
 };
 
@@ -100,20 +100,25 @@ pub async fn resolve_compose(
     desired: &DesiredState,
     context: &lightrail_plugin_protocol::OperationContext,
 ) -> Result<(Value, ComposeInventory, String), ComposePluginError> {
+    let root = desired.project_root(context)?;
+    let paths = desired.compose_paths(context)?;
     let document: Value = if let Some(path) = &desired.resolved_compose_path {
         let contents = tokio::fs::read(path)
             .await
             .map_err(ComposePluginError::TemporaryFile)?;
         serde_json::from_slice(&contents)?
     } else {
-        let root = desired.project_root(context)?;
-        let paths = desired.compose_paths(context)?;
-        let output =
-            run_local("docker", compose_config_arguments(&paths), Some(root), None).await?;
+        let output = run_local(
+            "docker",
+            compose_config_arguments(&paths),
+            Some(&root),
+            None,
+        )
+        .await?;
         serde_json::from_slice(&output.stdout)?
     };
     let inventory = inspect_document(&document)?;
-    let revision = deployment_revision(desired, &document);
+    let revision = deployment_revision(desired, &document, context)?;
     Ok((document, inventory, revision))
 }
 
@@ -162,7 +167,7 @@ pub async fn build_and_transfer(
     arguments.push(temporary.path().as_os_str().to_owned());
     arguments.push(OsString::from("--load"));
     arguments.extend(images.keys().map(OsString::from));
-    run_local("docker", arguments, Some(root), None).await?;
+    run_local("docker", arguments, Some(&root), None).await?;
 
     for image in images.values() {
         let local_id = run_local(
@@ -201,6 +206,7 @@ fn temporary_compose_file(prefix: &str) -> Result<tempfile::NamedTempFile, Compo
 #[allow(clippy::too_many_lines)]
 pub async fn deploy(
     desired: &DesiredState,
+    context: &lightrail_plugin_protocol::OperationContext,
     target: &TargetState,
     config: &PluginConfig,
     rendered: &RenderedDeployment,
@@ -211,7 +217,7 @@ pub async fn deploy(
     ensure_ingress(target, desired, config, &layout).await?;
     backup_previous(target, &layout, operation_id).await?;
     let mut base = rendered.base.clone();
-    upload_compose_assets(target, desired, &layout, &mut base).await?;
+    upload_compose_assets(target, desired, context, &layout, &mut base).await?;
 
     upload_json(
         target,
@@ -468,9 +474,11 @@ async fn resolve_remote_images(
 async fn upload_compose_assets(
     target: &TargetState,
     desired: &DesiredState,
+    context: &lightrail_plugin_protocol::OperationContext,
     layout: &RemoteLayout,
     document: &mut Value,
 ) -> Result<(), ComposePluginError> {
+    let root = desired.project_root(context)?;
     for kind in ["configs", "secrets"] {
         let assets = document
             .get(kind)
@@ -493,17 +501,17 @@ async fn upload_compose_assets(
                     "{kind} entry `{name}` has an unsafe name"
                 )));
             }
-            let local = std::path::PathBuf::from(&file);
-            let local = if local.is_absolute() {
-                local
-            } else {
-                desired
-                    .project
-                    .root
-                    .as_ref()
-                    .ok_or(ComposePluginError::MissingProjectRoot)?
-                    .join(local)
-            };
+            let local = canonical_project_source(
+                &root,
+                &root,
+                std::path::Path::new(&file),
+                &format!("Compose {kind} file `{name}`"),
+            )?;
+            if !local.is_file() {
+                return Err(ComposePluginError::InvalidDesired(format!(
+                    "Compose {kind} file `{name}` must be a regular file"
+                )));
+            }
             let remote_directory = format!("{}/assets", layout.environment_directory);
             let remote = format!("{remote_directory}/{kind}-{name}");
             let contents = tokio::fs::read(&local)

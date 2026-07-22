@@ -4,6 +4,7 @@ use std::fmt;
 use std::io;
 use std::path::PathBuf;
 use std::string::FromUtf8Error;
+use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -191,6 +192,17 @@ pub enum GitError {
         /// Underlying process error.
         #[source]
         source: io::Error,
+    },
+
+    /// A Git process exceeded its local discovery deadline and was terminated.
+    #[error("Git timed out after {timeout:?} while {operation}{cleanup}")]
+    TimedOut {
+        /// Description of the attempted operation.
+        operation: &'static str,
+        /// Hard deadline applied to the Git process.
+        timeout: Duration,
+        /// Optional cleanup failure, including its leading separator.
+        cleanup: String,
     },
 
     /// The starting path is not inside a Git working tree.

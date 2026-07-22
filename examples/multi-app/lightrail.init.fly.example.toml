@@ -1,0 +1,23 @@
+project_slug = "multi-example"
+compose = ["compose.yaml"]
+target = "fly"
+isolation = "environment"
+
+[[apps]]
+name = "frontend"
+service = "frontend"
+port = 8080
+health_path = "/health"
+health_status = 200
+
+[[apps]]
+name = "api"
+service = "api"
+port = 8080
+health_path = "/health"
+health_status = 200
+
+[settings.target]
+organization = "personal"
+ttl_hours = 72
+# region = "ams" # omit to let Fly select

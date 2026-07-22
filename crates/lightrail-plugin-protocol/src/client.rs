@@ -22,14 +22,83 @@ use crate::{
     ApplyRequest, ApplyResult, CancelRequest, CancelResult, ClientError, DestroyRequest,
     DestroyResult, Empty, InitializeRequest, InitializeResult, InspectRequest, InspectResult,
     JsonRpcError, LockAcquireRequest, LockAcquireResult, LockReleaseRequest, LockReleaseResult,
-    LogsRequest, LogsResult, MAX_MESSAGE_BYTES, PlanRequest, PlanResult, PluginError, PluginEvent,
-    RequestId, ValidateRequest, ValidateResult,
+    LogsRequest, LogsResult, MAX_MESSAGE_BYTES, OperationContext, PlanRequest, PlanResult,
+    PluginError, PluginEvent, RequestId, ValidateRequest, ValidateResult,
     error::TerminalFailure,
     methods,
     wire::{CancelRpcRequest, IncomingMessage, RpcNotification, RpcRequest},
 };
 
 type DynWriter = Box<dyn AsyncWrite + Send + Unpin>;
+
+/// Fallback deadline for short requests without operation-specific work units.
+pub const DEFAULT_REQUEST_TIMEOUT: Duration = Duration::from_secs(125 * 60);
+/// Hard upper bound for one typed provider operation request.
+pub const MAX_OPERATION_REQUEST_TIMEOUT: Duration = Duration::from_secs(24 * 60 * 60);
+
+const MAX_CONFIGURED_PHASE_SECONDS: u64 = 60 * 60;
+const DEFAULT_COMMAND_PHASE_SECONDS: u64 = 10 * 60;
+const DEFAULT_READINESS_PHASE_SECONDS: u64 = 5 * 60;
+const PROVIDER_COORDINATION_MARGIN_SECONDS: u64 = 5 * 60;
+
+/// Derive a bounded deadline for a typed provider operation.
+///
+/// One work unit receives the configured command phase plus readiness phase.
+/// Values are capped at the protocol's accepted 60-minute phase ceiling, a
+/// fixed coordination margin is added once, and the complete request is
+/// capped at 24 hours. Callers should use exact locked-plan action counts for
+/// mutations and exact selection/resource counts for scalable reads.
+#[must_use]
+pub fn operation_request_timeout(context: &OperationContext, work_units: usize) -> Duration {
+    let command = configured_phase_seconds(
+        &context.config,
+        "command_timeout_seconds",
+        DEFAULT_COMMAND_PHASE_SECONDS,
+    );
+    let readiness = configured_phase_seconds(
+        &context.config,
+        "readiness_timeout_seconds",
+        DEFAULT_READINESS_PHASE_SECONDS,
+    );
+    let units = u64::try_from(work_units.max(1)).unwrap_or(u64::MAX);
+    let seconds = command
+        .saturating_add(readiness)
+        .saturating_mul(units)
+        .saturating_add(PROVIDER_COORDINATION_MARGIN_SECONDS)
+        .min(MAX_OPERATION_REQUEST_TIMEOUT.as_secs());
+    Duration::from_secs(seconds)
+}
+
+fn configured_phase_seconds(config: &Value, key: &str, fallback: u64) -> u64 {
+    config
+        .get(key)
+        .and_then(Value::as_u64)
+        .map_or(fallback, |seconds| {
+            seconds.clamp(1, MAX_CONFIGURED_PHASE_SECONDS)
+        })
+}
+
+fn json_work_units(value: &Value) -> usize {
+    match value {
+        Value::Array(items) => items
+            .iter()
+            .map(json_work_units)
+            .fold(items.len().max(1), usize::max),
+        Value::Object(fields) => fields
+            .values()
+            .map(json_work_units)
+            .fold(fields.len().max(1), usize::max),
+        _ => 1,
+    }
+}
+
+fn selection_work_units(context: &OperationContext) -> usize {
+    context
+        .metadata
+        .pointer("/selection/environment_ids")
+        .and_then(Value::as_array)
+        .map_or(1, |selection| selection.len().max(1))
+}
 
 /// Core-side process behavior.
 #[derive(Clone, Copy, Debug)]
@@ -45,10 +114,10 @@ pub struct ClientOptions {
 impl Default for ClientOptions {
     fn default() -> Self {
         Self {
-            // Provisioning, local image transfer, and remote readiness checks can
-            // legitimately span several minutes. The timeout remains bounded and
-            // the client sends `plugin.cancel` when it expires.
-            request_timeout: Duration::from_secs(30 * 60),
+            // Initialization, cancellation, locks, logs, and extension calls
+            // use this fallback. Typed scalable operations derive a bounded
+            // call-specific timeout from their exact work units.
+            request_timeout: DEFAULT_REQUEST_TIMEOUT,
             shutdown_timeout: Duration::from_secs(5),
             event_buffer: 256,
         }
@@ -379,7 +448,23 @@ impl PluginClient {
     ///
     /// Returns a client or structured remote plugin error.
     pub async fn validate(&self, request: ValidateRequest) -> Result<ValidateResult, ClientError> {
-        self.request(methods::VALIDATE, &request).await
+        let timeout =
+            operation_request_timeout(&request.context, json_work_units(&request.desired));
+        self.validate_with_timeout(request, timeout).await
+    }
+
+    /// Validate plugin input with an explicit caller-derived deadline.
+    ///
+    /// # Errors
+    ///
+    /// Returns a client or structured remote plugin error.
+    pub async fn validate_with_timeout(
+        &self,
+        request: ValidateRequest,
+        timeout: Duration,
+    ) -> Result<ValidateResult, ClientError> {
+        self.request_with_timeout(methods::VALIDATE, &request, timeout)
+            .await
     }
 
     /// Compute a change plan.
@@ -388,7 +473,24 @@ impl PluginClient {
     ///
     /// Returns a client or structured remote plugin error.
     pub async fn plan(&self, request: PlanRequest) -> Result<PlanResult, ClientError> {
-        self.request(methods::PLAN, &request).await
+        let units = json_work_units(&request.desired)
+            .max(request.current.as_ref().map_or(1, json_work_units));
+        let timeout = operation_request_timeout(&request.context, units);
+        self.plan_with_timeout(request, timeout).await
+    }
+
+    /// Compute a change plan with an explicit caller-derived deadline.
+    ///
+    /// # Errors
+    ///
+    /// Returns a client or structured remote plugin error.
+    pub async fn plan_with_timeout(
+        &self,
+        request: PlanRequest,
+        timeout: Duration,
+    ) -> Result<PlanResult, ClientError> {
+        self.request_with_timeout(methods::PLAN, &request, timeout)
+            .await
     }
 
     /// Apply a change plan.
@@ -397,7 +499,23 @@ impl PluginClient {
     ///
     /// Returns a client or structured remote plugin error.
     pub async fn apply(&self, request: ApplyRequest) -> Result<ApplyResult, ClientError> {
-        self.request(methods::APPLY, &request).await
+        let units = request.plan.actions.len().saturating_add(1);
+        let timeout = operation_request_timeout(&request.context, units);
+        self.apply_with_timeout(request, timeout).await
+    }
+
+    /// Apply a change plan with an explicit caller-derived deadline.
+    ///
+    /// # Errors
+    ///
+    /// Returns a client or structured remote plugin error.
+    pub async fn apply_with_timeout(
+        &self,
+        request: ApplyRequest,
+        timeout: Duration,
+    ) -> Result<ApplyResult, ClientError> {
+        self.request_with_timeout(methods::APPLY, &request, timeout)
+            .await
     }
 
     /// Inspect provider/runtime state.
@@ -406,7 +524,24 @@ impl PluginClient {
     ///
     /// Returns a client or structured remote plugin error.
     pub async fn inspect(&self, request: InspectRequest) -> Result<InspectResult, ClientError> {
-        self.request(methods::INSPECT, &request).await
+        // Provider discovery cardinality is unknown until inspection returns:
+        // even a current-environment query may scan an account or cluster.
+        let timeout = operation_request_timeout(&request.context, usize::MAX);
+        self.inspect_with_timeout(request, timeout).await
+    }
+
+    /// Inspect provider/runtime state with an explicit caller-derived deadline.
+    ///
+    /// # Errors
+    ///
+    /// Returns a client or structured remote plugin error.
+    pub async fn inspect_with_timeout(
+        &self,
+        request: InspectRequest,
+        timeout: Duration,
+    ) -> Result<InspectResult, ClientError> {
+        self.request_with_timeout(methods::INSPECT, &request, timeout)
+            .await
     }
 
     /// Destroy managed state.
@@ -415,7 +550,26 @@ impl PluginClient {
     ///
     /// Returns a client or structured remote plugin error.
     pub async fn destroy(&self, request: DestroyRequest) -> Result<DestroyResult, ClientError> {
-        self.request(methods::DESTROY, &request).await
+        let units = selection_work_units(&request.context)
+            .max(request.current.as_ref().map_or(1, json_work_units))
+            .max(request.journal.len())
+            .saturating_add(1);
+        let timeout = operation_request_timeout(&request.context, units);
+        self.destroy_with_timeout(request, timeout).await
+    }
+
+    /// Destroy managed state with an explicit caller-derived deadline.
+    ///
+    /// # Errors
+    ///
+    /// Returns a client or structured remote plugin error.
+    pub async fn destroy_with_timeout(
+        &self,
+        request: DestroyRequest,
+        timeout: Duration,
+    ) -> Result<DestroyResult, ClientError> {
+        self.request_with_timeout(methods::DESTROY, &request, timeout)
+            .await
     }
 
     /// Cancel a logical operation.

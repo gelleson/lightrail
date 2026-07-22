@@ -59,6 +59,10 @@ pub struct EnvironmentSummaryView {
     pub status: ResourceStatus,
     #[serde(default)]
     pub endpoints: Vec<Endpoint>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expires_at: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expires_at_unix: Option<u64>,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -120,7 +124,7 @@ pub(super) fn collect_environment_summaries<'a>(
             continue;
         };
         for item in items {
-            let (environment_id, branch, profile, status, endpoints) =
+            let (environment_id, branch, profile, status, endpoints, expires_at, expires_at_unix) =
                 if let Some(environment_id) = item.as_str() {
                     (
                         environment_id.to_owned(),
@@ -128,6 +132,8 @@ pub(super) fn collect_environment_summaries<'a>(
                         None,
                         ResourceStatus::Unknown,
                         Vec::new(),
+                        None,
+                        None,
                     )
                 } else {
                     let Some(environment_id) = item
@@ -157,6 +163,10 @@ pub(super) fn collect_environment_summaries<'a>(
                             .map(ToOwned::to_owned),
                         status,
                         endpoints,
+                        item.get("expires_at")
+                            .and_then(Value::as_str)
+                            .map(ToOwned::to_owned),
+                        item.get("expires_at_unix").and_then(Value::as_u64),
                     )
                 };
             let candidate = EnvironmentSummaryView {
@@ -165,6 +175,8 @@ pub(super) fn collect_environment_summaries<'a>(
                 profile,
                 status,
                 endpoints,
+                expires_at,
+                expires_at_unix,
             };
             environments
                 .entry(environment_id)
@@ -211,6 +223,8 @@ pub(super) fn collect_environment_summaries<'a>(
                         profile: None,
                         status,
                         endpoints: Vec::new(),
+                        expires_at: None,
+                        expires_at_unix: None,
                     },
                 );
             }
@@ -228,6 +242,12 @@ fn merge_environment_summary(
     }
     if existing.profile.is_none() {
         existing.profile.clone_from(&candidate.profile);
+    }
+    if existing.expires_at.is_none() {
+        existing.expires_at.clone_from(&candidate.expires_at);
+    }
+    if existing.expires_at_unix.is_none() {
+        existing.expires_at_unix = candidate.expires_at_unix;
     }
     if existing.status == ResourceStatus::Unknown
         || (candidate.status != ResourceStatus::Unknown
@@ -647,6 +667,8 @@ mod tests {
                 profile: None,
                 status: ResourceStatus::Absent,
                 endpoints: Vec::new(),
+                expires_at: None,
+                expires_at_unix: None,
             }],
         };
 

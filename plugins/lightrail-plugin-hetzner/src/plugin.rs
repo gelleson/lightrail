@@ -193,6 +193,7 @@ impl PluginHandler for HetznerPlugin {
                 ..ExecutableMetadata::default()
             },
             capabilities: vec![Capability::Target, Capability::OperationLock],
+            features: Vec::new(),
             required_secrets: vec![SecretRequirement {
                 name: "hetzner-token".to_owned(),
                 description: Some(
@@ -2228,11 +2229,7 @@ fn server_payload(
 }
 
 fn plan_id(environment_id: &str, metadata: &Value, actions: &[PlannedAction]) -> String {
-    let action_shape: Vec<_> = actions
-        .iter()
-        .map(|action| (&action.id, &action.kind, action.destructive))
-        .collect();
-    hash_json(&(environment_id, metadata, action_shape))
+    hash_json(&(environment_id, metadata, actions))
 }
 
 fn create_action(id: &str, summary: &str) -> PlannedAction {
@@ -2259,7 +2256,14 @@ fn update_action(id: &str, summary: &str) -> PlannedAction {
         summary: summary.to_owned(),
         destructive: false,
         depends_on: Vec::new(),
-        rollback: None,
+        rollback: Some(RollbackMetadata {
+            supported: false,
+            action: None,
+            token: None,
+            metadata: json!({
+                "reason": "an in-place provider update has no exact retained prior-resource inverse"
+            }),
+        }),
         metadata: Value::Object(serde_json::Map::new()),
     }
 }
@@ -2487,6 +2491,53 @@ mod tests {
             plan_id("env", &metadata, &create),
             plan_id("env", &metadata, &delete)
         );
+
+        let mut modified = create.clone();
+        modified[0].summary = "modified summary".to_owned();
+        assert_ne!(
+            plan_id("env", &metadata, &create),
+            plan_id("env", &metadata, &modified)
+        );
+
+        let mut modified = create.clone();
+        modified[0].rollback = Some(RollbackMetadata {
+            supported: false,
+            action: None,
+            token: None,
+            metadata: json!({"reason": "modified"}),
+        });
+        assert_ne!(
+            plan_id("env", &metadata, &create),
+            plan_id("env", &metadata, &modified)
+        );
+    }
+
+    #[test]
+    fn every_mutating_action_declares_its_rollback_contract() {
+        let create = create_action("create-server", "create");
+        assert!(
+            create
+                .rollback
+                .as_ref()
+                .is_some_and(|rollback| rollback.supported)
+        );
+
+        for action in [
+            update_action("update-server", "update"),
+            delete_action("delete-server", "delete"),
+        ] {
+            let rollback = action
+                .rollback
+                .expect("mutating actions declare rollback support");
+            assert!(!rollback.supported);
+            assert!(
+                rollback
+                    .metadata
+                    .get("reason")
+                    .and_then(Value::as_str)
+                    .is_some_and(|reason| !reason.is_empty())
+            );
+        }
     }
 
     #[test]

@@ -188,6 +188,9 @@ pub struct PluginManifest {
     /// Implemented capabilities.
     #[serde(default)]
     pub capabilities: Vec<Capability>,
+    /// Optional namespaced behavior contracts implemented by this plugin.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub features: Vec<String>,
     /// Secrets core may resolve and pass to this plugin.
     #[serde(default)]
     pub required_secrets: Vec<SecretRequirement>,

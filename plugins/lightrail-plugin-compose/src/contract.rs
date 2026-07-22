@@ -96,6 +96,7 @@ pub struct EnvironmentSpec {
 #[serde(rename_all = "snake_case")]
 pub enum Isolation {
     Project,
+    Environment,
     Machine,
 }
 
@@ -278,23 +279,40 @@ impl DesiredState {
         Ok(desired)
     }
 
-    /// Select the explicitly supplied project root.
+    /// Validate and select the project root granted by the operation context.
     ///
     /// # Errors
     ///
-    /// Returns an error when neither desired state nor context has a root.
-    pub fn project_root<'a>(
-        &'a self,
-        context: &'a OperationContext,
-    ) -> Result<&'a Path, ComposePluginError> {
-        self.project
+    /// Returns an error when either root is missing, unreadable, not a
+    /// directory, or resolves to a different location.
+    pub fn project_root(&self, context: &OperationContext) -> Result<PathBuf, ComposePluginError> {
+        let desired = self
+            .project
             .root
             .as_deref()
-            .or_else(|| context.project_root.as_deref().map(Path::new))
-            .ok_or(ComposePluginError::MissingProjectRoot)
+            .ok_or(ComposePluginError::MissingProjectRoot)?;
+        let granted = context
+            .project_root
+            .as_deref()
+            .map(Path::new)
+            .ok_or(ComposePluginError::MissingProjectRoot)?;
+        let desired = canonical_path(desired, "desired project root")?;
+        let granted = canonical_path(granted, "operation project root")?;
+        if !granted.is_dir() {
+            return Err(ComposePluginError::InvalidDesired(
+                "the operation project root must be a directory".to_owned(),
+            ));
+        }
+        if desired != granted {
+            return Err(ComposePluginError::InvalidDesired(
+                "desired project root does not match the operation's granted Git root".to_owned(),
+            ));
+        }
+        Ok(granted)
     }
 
-    /// Resolve committed relative Compose paths beneath the project root.
+    /// Resolve committed relative Compose paths beneath the granted project
+    /// root, including symbolic-link containment.
     ///
     /// # Errors
     ///
@@ -304,12 +322,25 @@ impl DesiredState {
         context: &OperationContext,
     ) -> Result<Vec<PathBuf>, ComposePluginError> {
         let root = self.project_root(context)?;
-        Ok(self
-            .project
+        self.project
             .compose
             .iter()
-            .map(|path| root.join(path))
-            .collect())
+            .map(|path| {
+                let source = canonical_project_source(
+                    &root,
+                    &root,
+                    path,
+                    &format!("Compose file `{}`", path.display()),
+                )?;
+                if !source.is_file() {
+                    return Err(ComposePluginError::InvalidDesired(format!(
+                        "Compose file `{}` must be a regular file",
+                        path.display()
+                    )));
+                }
+                Ok(source)
+            })
+            .collect()
     }
 
     fn validate_shape(&self) -> Result<(), ComposePluginError> {
@@ -397,6 +428,90 @@ impl DesiredState {
         }
         Ok(services)
     }
+}
+
+/// Resolve a local source path and prove that symbolic links cannot escape the
+/// granted Git project root.
+///
+/// # Errors
+///
+/// Returns an error when the source is unreadable, uses parent traversal, or
+/// resolves outside `root`.
+pub fn canonical_project_source(
+    root: &Path,
+    base: &Path,
+    source: &Path,
+    description: &str,
+) -> Result<PathBuf, ComposePluginError> {
+    if source
+        .components()
+        .any(|component| matches!(component, Component::ParentDir | Component::Prefix(_)))
+    {
+        return Err(ComposePluginError::InvalidDesired(format!(
+            "{description} must remain inside the current Git project root"
+        )));
+    }
+    let candidate = if source.is_absolute() {
+        source.to_path_buf()
+    } else {
+        base.join(source)
+    };
+    let canonical = canonical_path(&candidate, description)?;
+    if !canonical.starts_with(root) {
+        return Err(ComposePluginError::InvalidDesired(format!(
+            "{description} resolves outside the current Git project root, including through a symbolic link"
+        )));
+    }
+    Ok(canonical)
+}
+
+/// Convert a previously validated source into a portable, slash-separated
+/// project-relative path.
+///
+/// # Errors
+///
+/// Returns an error for a path outside `root` or non-UTF-8 path components.
+pub fn project_relative_source(
+    root: &Path,
+    source: &Path,
+    description: &str,
+) -> Result<String, ComposePluginError> {
+    let relative = source.strip_prefix(root).map_err(|_| {
+        ComposePluginError::InvalidDesired(format!(
+            "{description} must remain inside the current Git project root"
+        ))
+    })?;
+    let mut parts = Vec::new();
+    for component in relative.components() {
+        match component {
+            Component::CurDir => {}
+            Component::Normal(part) => {
+                parts.push(part.to_str().ok_or_else(|| {
+                    ComposePluginError::InvalidDesired(format!(
+                        "{description} must use UTF-8 path components"
+                    ))
+                })?);
+            }
+            Component::ParentDir | Component::RootDir | Component::Prefix(_) => {
+                return Err(ComposePluginError::InvalidDesired(format!(
+                    "{description} must remain inside the current Git project root"
+                )));
+            }
+        }
+    }
+    Ok(if parts.is_empty() {
+        ".".to_owned()
+    } else {
+        parts.join("/")
+    })
+}
+
+fn canonical_path(path: &Path, description: &str) -> Result<PathBuf, ComposePluginError> {
+    std::fs::canonicalize(path).map_err(|error| {
+        ComposePluginError::InvalidDesired(format!(
+            "{description} must exist and be readable: {error}"
+        ))
+    })
 }
 
 impl PluginConfig {

@@ -1,9 +1,10 @@
 # Lightrail product specification
 
-Status: implemented MVP contract. The CLI, protocol, and bundled Compose, SSH,
-and Hetzner plugins are present and covered by automated tests. See the README
-for current live-validation status; this document intentionally keeps the
-behavioral contract independent of dated smoke-test results.
+Status: implemented local-first contract. The CLI, protocol, and bundled
+Compose, SSH, Hetzner, Kubernetes, and Fly plugins are present and covered by
+automated tests. See the README for current live-validation status; this
+document intentionally keeps the behavioral contract independent of dated
+smoke-test results.
 
 This document turns the product interview into a durable behavioral
 specification. “Must” describes an MVP invariant. Where the current
@@ -19,8 +20,8 @@ remote, HTTPS-accessible environment.
 It is intended for branch previews, pull-request-style environments, and
 temporary integration environments without requiring a Git hosting provider.
 It builds locally, deploys remotely, and remains agentless: the remote system
-runs ordinary infrastructure components such as Docker, Compose, and Traefik,
-but no Lightrail daemon.
+runs ordinary infrastructure components such as Docker/Compose/Traefik,
+Kubernetes workloads, or Fly Machines, but no Lightrail daemon.
 
 ### 1.1 MVP goals
 
@@ -28,12 +29,12 @@ The MVP must:
 
 1. Create reusable, named deployment profiles with `lightrail init`.
 2. Treat the current Git worktree and branch as the source revision.
-3. Build Compose services locally and deploy them to generic SSH or Hetzner
-   targets.
+3. Build Compose services locally and deploy them to generic SSH, Hetzner,
+   existing Kubernetes, or Fly targets.
 4. Expose several apps in one project at separate, predictable HTTPS
    subdomains.
-5. Isolate environments either as separate Compose projects on a shared host
-   or as separate machines.
+5. Isolate environments as separate Compose projects on a shared host,
+   dedicated machines, or provider-native namespaces/application groups.
 6. Reconcile repeated deployments, verify readiness, and automatically roll
    back failed changes where possible.
 7. Rediscover environments from provider and runtime metadata without a
@@ -52,10 +53,12 @@ The following are not part of the MVP:
 - building a branch that is not the current checkout;
 - switching branches or editing the user's worktree;
 - private tunnel exposure;
-- Fly.io, Kubernetes, or k3s targets;
+- provisioning, resizing, or deleting Kubernetes clusters or nodes;
+- installing or upgrading shared Kubernetes ingress, certificate, registry,
+  or RBAC components through a `setup` command;
 - custom DNS zones or DNS-provider APIs;
 - raw public TCP or UDP services;
-- blue/green or rolling deployment;
+- user-selectable blue/green, canary, or advanced rollout strategies;
 - remote shell execution;
 - a usage or cost-reporting command;
 - native Windows support;
@@ -65,7 +68,8 @@ The following are not part of the MVP:
 - restoration of application data changed by a failed revision.
 
 The architecture must leave clear extension points for these future
-capabilities without pretending they are available now.
+capabilities without pretending they are available now. Kubernetes support
+connects only to an existing cluster; Fly support remains agentless.
 
 ## 2. Domain model and invariants
 
@@ -89,7 +93,7 @@ project's ownership identity.
 A profile is a reusable deployment policy, such as `preview` or `staging`. It
 selects:
 
-- isolation mode;
+- isolation mode (`project`, `environment`, or `machine`);
 - public apps;
 - source, builder, target, runtime, exposure, and DNS plugins;
 - settings owned and validated by those plugins.
@@ -131,8 +135,31 @@ observed IDs and repository digests of deployed images. The previous healthy
 generated documents are retained sufficiently to support best-effort
 application rollback.
 
+For the SSH/Hetzner Compose runtime, canonical revision input removes the
+checkout root and ephemeral resolved-file path, represents Compose files,
+build contexts, Dockerfiles, and file-backed configs/secrets relative to the
+granted Git root, and normalizes Compose-generated project, default-network,
+and volume names. Resolved service environment values and explicit
+profile/app environment literal values are reduced to non-secret key/reference
+shape. Any local build, resolved or explicit environment, or file-backed asset
+makes the revision operation-scoped. This preserves Buildx cache reuse and
+forces each affected `up` to reconcile without deriving provider-visible
+metadata from environment or asset plaintext.
+
 Persistent volume contents, database mutations, and historical secret values
 are not revisions and are not rollback-capable.
+
+OCI images pushed for Kubernetes or Fly are immutable build artifacts/cache,
+not environment runtime resources. Normal environment destruction does not
+delete them.
+
+### 2.6 Environment expiry
+
+Environment-isolated Kubernetes and Fly profiles define `ttl_hours`, default
+72. A successful `up` refreshes a provider-visible expiry deadline for that
+environment. Expiry is metadata, not an automatic deletion timer:
+`lightrail prune` must still inspect, plan, confirm, lock, re-inspect, and
+delete the exact expired set.
 
 ## 3. Current-working-directory and Git semantics
 
@@ -234,7 +261,7 @@ DATABASE_URL = { secret = "preview-database-url" }
 
 Plugin-specific settings are opaque to the core except for structural and
 plugin validation. Each manifest exposes a versioned JSON Schema and prompt
-hints. The current `init` flow has built-in questions for the three bundled
+hints. The current `init` flow has built-in questions for the five bundled
 plugins; it does not yet render arbitrary third-party schemas interactively.
 The core validates capability assignments; `init` and the Compose plugin
 verify that every app maps to an existing Compose service and internal port.
@@ -252,10 +279,20 @@ Explicit profile/app values in `lightrail.toml` override Compose values.
 Resolution occurs locally before provisioning; missing required variables must
 fail before remote resources are created.
 
-Compose `configs` and `secrets` backed by `file:` are transferred as deployment
-material. Local bind mounts are rejected because they depend on developer
-paths and can copy source unexpectedly. Application source reaches the target
-only inside images built from the declared build contexts.
+For SSH/Hetzner, Compose `configs` and `secrets` backed by `file:` are
+transferred as deployment material. The native Kubernetes translator currently
+rejects those Compose entries; Fly rejects application secret references.
+Local bind mounts are rejected because they depend on developer paths and can
+copy source unexpectedly. Application source reaches the target only inside
+images built from the declared build contexts.
+
+The desired project root must resolve to exactly the Git root granted in the
+operation context. Compose files, local build contexts, Dockerfiles, and
+file-backed configs/secrets must exist inside that root after symbolic-link
+resolution. The SSH/Hetzner runtime accepts only the normalized implicit
+`default` network and environment-scoped generated volume names; custom,
+external, multiple, aliased, static-address network semantics and custom
+volume names/drivers/options fail during validation.
 
 For `up`, core writes the output of `docker compose config --format json` to a
 local process-lifetime temporary file. That file preserves Compose's resolved
@@ -268,7 +305,8 @@ Compose documents and transferred config/secret files are also mode `0600`;
 the rediscovery manifest omits app environment values.
 
 Named volumes begin empty for a new environment and are scoped to that
-environment.
+environment. Kubernetes persistent volume claims and Fly volumes follow the
+same lifecycle: repeated `up` preserves them and `down` deletes them.
 
 ## 5. Initialization
 
@@ -280,7 +318,8 @@ environment.
 3. detect Compose services, build contexts, and candidate ports;
 4. ask which services are public apps and which internal port each uses;
 5. create an immutable project ID and default profile;
-6. select the bundled Compose plugin plus the SSH or Hetzner target plugin;
+6. select the bundled Compose plugin plus the SSH, Hetzner, Kubernetes, or Fly
+   provider plugin;
 7. write `lightrail.toml` and `lightrail.lock`;
 8. ensure generated `.lightrail/` state is ignored; and
 9. validate the resulting configuration without provisioning.
@@ -350,6 +389,208 @@ inspection or deployment:
 lightrail secret set hetzner-token
 ```
 
+Kubernetes initialization requires an existing kube context, an OCI registry
+host and repository prefix, an existing NGINX or Traefik ingress class, and
+the exact LoadBalancer Service backing that class:
+
+```toml
+project_slug = "myproject"
+compose = ["compose.yaml"]
+target = "kubernetes"
+isolation = "environment"
+dns_domain = "sslip.io"
+
+[[apps]]
+name = "frontend"
+service = "web"
+port = 3000
+
+[settings.target]
+context = "rackspace-spot"
+kubeconfig = "/home/me/.kube/config" # optional absolute path
+registry = "ghcr.io"
+repository = "my-team/previews"
+ingress_class = "nginx"
+ingress_service_namespace = "ingress-nginx"
+ingress_service_name = "ingress-nginx-controller"
+namespace_prefix = "lr"
+control_namespace = "lightrail-system"
+dns_domain = "sslip.io"
+cluster_issuer = "letsencrypt"
+# image_pull_secret = "registry-pull"
+replicas = 1
+ttl_hours = 72
+command_timeout_seconds = 300
+readiness_timeout_seconds = 300
+```
+
+The selected cluster, context, control namespace and RBAC, ingress class,
+exact ingress-controller LoadBalancer Service, configured cert-manager
+`ClusterIssuer`, and registry already exist. The issuer must report Ready and
+contain an HTTP-01 solver. A configured image-pull Secret must be made
+available in each environment namespace by existing admission/setup policy;
+Lightrail does not copy local registry credentials. Lightrail neither
+provisions those shared components nor changes an existing ingress controller.
+With `platforms = []`, Lightrail discovers Linux architectures from Ready,
+schedulable nodes. An explicit list must be a subset of that observed set and
+constrains both image builds and Pods: one architecture uses a node selector,
+while multiple architectures use required node affinity. The local Docker
+client must be authorized to push, and cluster pull authorization is a
+separate prerequisite.
+
+Kubernetes initialization supplies `cluster_issuer = "letsencrypt"` by
+default, but the resulting plugin setting is required, non-empty, and must
+name an existing Ready cert-manager `ClusterIssuer` with an HTTP-01 solver.
+Other defaults are
+`namespace_prefix = "lr"`, `control_namespace = "lightrail-system"`,
+`dns_domain = "sslip.io"`, `platforms = []`, `replicas = 1`,
+`ttl_hours = 72`, `traefik_http_entrypoint = "web"`,
+`traefik_https_entrypoint = "websecure"`, and both command/readiness timeouts
+at 300 seconds. The two Traefik entrypoint names must be distinct DNS labels.
+Replicas are limited to 1–100, TTL to 1–8760 hours, and each timeout to
+1–3600 seconds. `kubeconfig`, when set, must be an absolute normalized path;
+`image_pull_secret`, when set, names an existing Secret available under the
+environment namespace's cluster policy. `registry` is a non-loopback host
+without a URL scheme or repository path; `repository` is configured
+separately. `namespace_prefix` is a DNS label no longer than 32 characters.
+`ingress_service_namespace` is a DNS subdomain and `ingress_service_name` is
+a DNS label; both are required and identify the one exact existing
+LoadBalancer Service whose status supplies the public ingress address.
+
+The Kubernetes source translator rejects every non-empty service field it
+does not explicitly translate or validate, including `network_mode`,
+privileged containers, local bind mounts, and Compose `configs`/`secrets`
+entries. Only the normalized implicit Compose `default` network is accepted;
+custom, external, multiple, aliased, statically addressed, driver-configured,
+or otherwise optioned networks fail closed. Named volumes must use ordinary
+environment-owned generated declarations; external volumes, custom names,
+drivers, and driver options are rejected, as are non-empty top-level Compose
+config or secret declarations. Every service needs `build:` or `image:`. The
+operation context's granted Git root is the only build-source authority:
+contexts and explicit Dockerfiles must resolve inside it after symbolic-link
+resolution. Clean revision identity converts those paths to project-relative
+form and removes only validated directory-derived Compose project, implicit
+network, and named-volume names. Because Git cannot prove that ignored files
+are absent from a Docker build context, every local-build revision also
+includes the operation ID; Buildx still reuses content-addressed layers.
+Resolved service environment values are replaced by a key-only shape before
+revision hashing and never produce a plaintext-derived provider label. A
+named-volume service is stateful by default; `x-lightrail: { kind: stateful }`
+makes that intent explicit and `x-lightrail: { kind: job }` selects an explicit
+Job. Every non-Job service receives private cluster DNS. When no service port
+exists, the translator creates a selector-backed headless Service and does not
+guess a port.
+Completed Jobs are retained until environment teardown and receive no Job TTL.
+An unchanged image-only Job is idempotent across repeated `up`; an existing
+local-build Job requires `down` then `up` on every later operation because its
+conservative operation-scoped image revision changes the immutable Job spec.
+Long-running workloads that use generated environment Secrets receive one
+non-secret, operation-derived Pod-template revision per `up`; this rolls
+changed environment values into Pods without hashing or retaining secret
+plaintext in metadata. NGINX routes get explicit SSL-redirect annotations.
+Traefik requires a current or legacy
+Middleware CRD (`traefik.io/v1alpha1` or
+`traefik.containo.us/v1alpha1`) and receives an environment-owned,
+namespace-qualified RedirectScheme Middleware. Any other IngressClass
+controller fails validation; there is no generic fallthrough that could omit
+the redirect contract. The configured HTTP and HTTPS entrypoint names are used
+for the redirect-only and TLS Ingresses respectively; Lightrail never edits
+the shared Traefik static configuration.
+
+Kubernetes `up` never uses a destructive replacement to force desired
+topology. Removing an owned runtime or exposure resource, adding a runtime
+resource to an environment with an observed prior revision, or changing a
+present immutable Job fails with explicit `down` then `up` remediation.
+Changes to existing Deployments and StatefulSets are explicitly marked
+non-reversible because retaining a complete live manifest could retain
+injected secret-bearing fields. If a later phase fails, that runtime update is
+reported as rollback-incomplete. Initial namespace cleanup and exact
+prior-state compensation for Exposure resources and expiry metadata remain
+supported. Namespace deletion during `down` or `prune` advertises an explicit
+unsupported inverse because deleted workloads, Secrets, PVC objects, and
+application data cannot be reconstructed exactly.
+
+Fly initialization uses provider-native environment isolation and creates a
+profile with these defaults:
+
+```toml
+project_slug = "myproject"
+compose = ["compose.yaml"]
+target = "fly"
+isolation = "environment"
+
+[[apps]]
+name = "frontend"
+service = "web"
+port = 3000
+
+[settings.target]
+organization = "personal"
+# region = "iad"
+registry = "registry.fly.io"
+platform = "linux/amd64"
+app_prefix = "lr"
+cpu_kind = "shared"
+cpus = 1
+memory_mb = 256
+auto_stop = true
+ttl_hours = 72
+lock_ttl_seconds = 3600
+volume_size_gb = 3
+token = { secret = "fly-token" }
+```
+
+Set `fly-token` through the ordinary secret flow before provider inspection or
+deployment. Fly uses its native `fly.dev` hostname and does not accept the
+`--domain`/`dns_domain` choice. For both environment-isolated providers,
+`ttl_hours` defaults to 72 and is refreshed by `up`; expiry is acted on only
+by an explicit `lightrail prune`.
+
+Fly creates one deterministic App and exactly one Machine per resolved Compose
+service. Every App in the environment joins the same deterministic custom 6PN
+membership boundary; Lightrail does not manage that name as a separate network
+resource. Only services selected as public apps receive a shared IPv4 and Fly
+Proxy routing. A service may have at most one named volume, sized by
+`volume_size_gb` (default 3) when it is first created; existing volumes are not
+resized. An explicit `region` is required when any named volume is used. Bind
+and external volumes are rejected. The current Fly runtime also rejects host
+networking, privileged services, `env_file`, Compose `configs`/`secrets`,
+unsupported service/deploy fields, and application secret references until a
+safe provider-native secret mutation path is implemented. Every service
+requires `build:` or `image:`. Compose `command` and `entrypoint`, when
+present, must use list form. A Compose `healthcheck` is accepted as source
+metadata and remains revision input, but is not translated to a Fly Machine
+check. The Lightrail app's `health_path`, `health_status`,
+`health_interval_seconds`, and `health_timeout_seconds` are authoritative for
+generated Machine checks and final readiness. A configured `health_status`
+must be a 2xx value; without one, final endpoint readiness still accepts any
+status below 500. Final public readiness also requires the provider-native
+HTTPS endpoint and exact HTTP-to-HTTPS redirect. Private services receive no
+public Fly service or check from this contract. `auto_stop` and autostart are
+Fly Proxy service settings for public services. A private service has no Proxy
+wake trigger, so its always-restart Machine remains running and must be counted
+in preview cost. An existing environment's exact Compose service/App set is a
+continuity boundary: adding or removing a service fails closed and requires an
+explicit `down` followed by `up`. Changing named-volume topology or Machine
+region, changing the requested `volume_size_gb`, or making a previously public
+service private also requires `down` then `up`. In-place revisions of the
+existing service set retain their deterministic Apps, but the current plugin
+does not implement an exact previous-revision inverse for an existing Machine
+update. A failure after such an update is reported as rollback-incomplete.
+
+Fly fixes `registry = "registry.fly.io"` and supports
+`platform = "linux/amd64"` or `platform = "linux/arm64"`. Defaults are
+`organization = "personal"`, provider-selected region, `app_prefix = "lr"`,
+shared CPU kind, one CPU, 256 MiB, `auto_stop = true`, `ttl_hours = 72`,
+`lock_ttl_seconds = 3600`, `volume_size_gb = 3`,
+`command_timeout_seconds = 300`, and `readiness_timeout_seconds = 300`. Memory
+must be at least 256 MiB in 256 MiB increments. Command and readiness timeouts
+are each limited to 10–3000 seconds. Lock TTL is limited to 60–86400 seconds
+and must exceed the larger timeout by more than 180 seconds; the remaining
+numeric capacities must be positive. Organization is a provider slug up to
+128 characters; region and `app_prefix` are provider-safe slugs up to 16
+characters.
+
 A non-interactive run fails rather than prompting when target or app input is
 ambiguous or required target settings are absent.
 
@@ -365,17 +606,17 @@ Edit the committed clone to change its target or app policy.
 
 ## 6. Hostnames, DNS, and TLS
 
-### 6.1 Exact hostname layout
+### 6.1 Endpoint layout
 
-Each public app hostname must be:
+SSH and Hetzner public app hostnames are:
 
 ```text
 <branch>.<app>.<profile>.<project>.<8-hex-ip>.<dns-domain>
 ```
 
-Only `sslip.io` and `nip.io` are valid MVP DNS domains. Branch is always the
-first label; app is always the second. Public mode requires a public IPv4
-address; IPv6-only targets are not supported by this MVP naming contract.
+Only `sslip.io` and `nip.io` are valid IP-DNS domains. Branch is always the
+first label and app is always the second for this hostname form. It requires a
+public IPv4 address; IPv6-only targets are unsupported.
 
 For IPv4 `203.0.113.10`, encode each octet as two lowercase hexadecimal
 characters, preserving zeroes:
@@ -391,9 +632,27 @@ https://feature-login.frontend.preview.myproject.cb00710a.sslip.io
 https://feature-login.api.preview.myproject.cb00710a.sslip.io
 ```
 
+Kubernetes uses the configured IngressClass and reads the public address from
+the exact configured LoadBalancer Service backing it. The generic plugin uses
+a public ingress IPv4 with the same branch-first/app-second hexadecimal
+`sslip.io` or `nip.io` form selected by the profile. A load-balancer status
+hostname is not itself proof that arbitrary child names are delegated to the
+cluster, so a hostname-only Service status fails with remediation instead of
+synthesizing an invalid URL. The plugin must not guess among ingress classes
+or Services, or modify an existing NGINX, Traefik, or other controller.
+
+Fly creates one App per Compose service. A selected public service receives
+the provider-native HTTPS endpoint
+`https://<app-prefix>-p<project-marker>-<branch>-<app>-<stable-suffix>.fly.dev`,
+subject to Fly name-length normalization. The project marker separates
+immutable projects within an organization, the readable identity keeps branch
+before app, and the suffix prevents resource collisions. `lightrail urls`
+remains authoritative and callers must not synthesize the normalized URL.
+
 ### 6.2 Label normalization
 
-Every branch, app, profile, and project label must:
+For the SSH/Hetzner/Kubernetes IP-DNS form, every branch, app, profile, and
+project label must:
 
 1. be lowercased;
 2. replace non-DNS-label characters with `-`;
@@ -408,22 +667,35 @@ lowercase hexadecimal characters of the SHA-256 hash of the original value.
 Truncate the readable prefix as needed so the suffix and full label remain
 within limits. Empty normalized labels are invalid.
 
+Fly normalizes branch and app/service fragments inside one provider App name,
+not as separate DNS labels. It lowercases them, replaces unsafe runs with
+hyphens, trims and truncates them to the available name budget, and relies on
+the immutable-project marker plus stable resource suffix for collision
+resistance. Callers must use the provider name returned by `lightrail urls`.
+
 Uncommitted changes do not alter a hostname. Detached HEAD uses the
 `sha-<12-character-commit>` label described earlier.
 
 ### 6.3 Public HTTPS contract
 
-There is no localhost or plain-HTTP application URL in the MVP.
+There is no localhost application URL.
 
-- Every public app is routed by Traefik at its final hostname.
+- SSH and Hetzner route every public app through Traefik at its final
+  hostname.
 - SSH targets must reject literal loopback addresses and any hostname whose
   bounded system resolution includes loopback or IPv4-mapped loopback.
-- ACME HTTP-01 obtains a certificate for each hostname.
+- ACME HTTP-01 obtains a certificate for each SSH/Hetzner hostname.
 - Port 80 must remain reachable for the HTTP-01 challenge and redirect ordinary
   HTTP traffic to HTTPS.
 - Port 443 serves the application with the issued certificate.
 - Lightrail must verify the final HTTPS route as part of readiness.
 - Wildcard certificates and custom DNS challenges are outside the MVP.
+- Kubernetes requires the selected existing ingress/TLS policy to produce a
+  trusted HTTPS route. The required named cert-manager `ClusterIssuer` must
+  already exist, report Ready, and contain an HTTP-01 solver.
+- Kubernetes readiness also requires same-host plain HTTP to redirect to the
+  final HTTPS route.
+- Fly delegates public TLS and routing to Fly Proxy.
 
 HTTP-01 is an HTTP reachability check, not merely a DNS lookup: the hostname
 must resolve to the target and the challenge token must be reachable on port
@@ -439,23 +711,33 @@ runtime deployment.
 
 For every Compose service containing `build:`:
 
-1. Detect target architecture (`amd64` or `arm64`).
-2. Build locally with Docker Buildx for that target.
+1. Discover or validate the target platform (`linux/amd64` or
+   `linux/arm64`).
+2. Build locally with Docker Buildx for that platform.
 3. Enable normal Buildx cache reuse.
 4. Tag the output deterministically from environment, service, and revision.
-5. Compare the local and remote Docker image IDs.
-6. Compress and stream images whose remote ID differs.
-7. Load them into the remote Docker engine with `docker load`.
+5. For SSH and Hetzner, compare local and remote Docker image IDs, compress
+   images whose remote ID differs, and load them into the remote Docker
+   engine.
+6. For Kubernetes and Fly, push deterministic OCI references to the
+   configured provider-reachable registry and deploy those references.
 
 Every `up` requests a Buildx build of build-backed services. Buildx cache and
-image-ID comparison make unchanged builds inexpensive and avoid unnecessary
-transfer.
+the target-specific image comparison or registry behavior make unchanged
+builds inexpensive. Kubernetes registry authentication is an explicit local
+prerequisite and cluster pull authorization is separate from the developer's
+push authorization. Fly uses `fly-token` in an isolated temporary Docker
+configuration for `registry.fly.io` pushes and resolves locally built tags to
+immutable digests before Machine deployment.
 
-Images referenced only by `image:` are pulled remotely for the target
-platform. The current deployment keeps the configured reference rather than
-rewriting it to a digest; after apply, the plugin records the observed image
-ID and repository digests in the non-secret manifest. Strict digest pinning of
-external images is therefore not yet implemented.
+Images referenced only by `image:` are pulled by the target runtime. The
+current deployment keeps the configured reference rather than rewriting it to
+a digest. Strict digest pinning of external images is therefore not yet
+implemented.
+
+OCI images pushed for Kubernetes and Fly are deliberately outside the
+environment destruction aggregate. `down` retains them as registry build
+cache; repository retention and garbage collection remain registry policy.
 
 Lightrail transfers only:
 
@@ -464,7 +746,9 @@ Lightrail transfers only:
 - allowed Compose configs and secrets; and
 - resolved runtime environment material.
 
-It must not synchronize the source tree as loose files or copy persistent
+The transfer list applies to the SSH/Hetzner path. Kubernetes and Fly receive
+only the pushed OCI artifacts and provider-native desired resources. No target
+may receive the source tree as loose files or a copy of persistent
 volume/database data.
 
 ## 8. Targets and isolation
@@ -472,7 +756,7 @@ volume/database data.
 Profiles set:
 
 ```toml
-isolation = "project" # or "machine"
+isolation = "project" # or "environment" or "machine"
 ```
 
 ### 8.1 Project isolation
@@ -505,6 +789,33 @@ Machine isolation is the default for Hetzner:
 
 Target plugins may reject an isolation mode they cannot safely provide.
 
+### 8.3 Environment isolation
+
+Environment isolation is the required mode for Kubernetes and Fly:
+
+- one deterministic environment aggregate belongs to one project, profile,
+  and raw branch;
+- Kubernetes places that aggregate in one environment-owned namespace,
+  including workloads, Services, Ingresses, and persistent volume claims;
+- Kubernetes claims a new namespace with an atomic create and records the
+  configured control namespace as part of its ownership authority;
+- Fly represents the aggregate with exactly owned Apps, Machines, and volumes;
+  App-attached routing/address state is included only after the same immutable
+  Machine ownership continuity is proven;
+- repeated `up` reconciles that aggregate while preserving its persistent
+  volumes;
+- ordinary `down` deletes only that environment's aggregate and volumes; and
+- `down --all` discovers and deletes all aggregates for the immutable project
+  visible through the selected context/account and credentials.
+
+The existing Kubernetes cluster, nodes, control namespace, ingress controller,
+certificate issuer, registry, and registry images are shared prerequisites
+and remain after environment destruction. Fly registry images are likewise
+retained as build cache. For the safe initial contract, every mutation on an
+Environment-isolated profile takes one project lock. Resource isolation
+remains per environment, but different branches do not mutate the same
+Kubernetes project/Fly project concurrently.
+
 ## 9. Bootstrap
 
 Generic SSH defaults to automatic, idempotent bootstrap:
@@ -532,12 +843,28 @@ Traefik and the per-environment ingress networks are reconciled by the
 Compose plugin after target bootstrap. Re-running either phase must converge
 safely.
 
+Kubernetes has no bootstrap or cluster-setup phase. Preflight uses the
+explicit context, reads the existing control namespace and IngressClass,
+discovers architectures from Ready, schedulable Linux nodes, and observes the
+exact configured ingress-controller LoadBalancer Service. Explicit
+`platforms` must be a subset of those observed architectures. It rejects a
+literal or resolved loopback Kubernetes API host before mutation. Other RBAC,
+registry pull, certificate, admission, storage, and image-pull Secret
+prerequisites are checked by the operator or at their first exact use.
+Lightrail does not create clusters, nodes, shared namespaces, RBAC, ingress
+controllers, certificate issuers, registries, or pull credentials.
+
+Fly is agentless. Preflight validates the explicit organization, region when
+set, provider credential, build platform, and provider access; it never
+installs a Lightrail daemon or logs into a remote machine.
+
 ## 10. Network boundary
 
-Lightrail generates a private deployment override and never edits the user's
-Compose files.
+Lightrail never edits the user's Compose files. SSH/Hetzner generate a private
+deployment override. Kubernetes/Fly translate the resolved Compose intent into
+provider-native resources.
 
-The generated deployment must:
+For SSH and Hetzner, the generated deployment must:
 
 - remove host-published ports by default;
 - expose selected HTTP apps only through Traefik using internal service ports;
@@ -558,6 +885,24 @@ For managed Hetzner infrastructure, the managed firewall exposes:
 Generic SSH validates required connectivity and reports firewall remediation,
 but must not rewrite an unknown host firewall.
 
+For Kubernetes:
+
+- each environment has its own namespace and default-private Services;
+- every non-Job service has private cluster DNS, including a selector-backed
+  headless Service when the Compose service declares no port;
+- only selected public apps receive Ingress routes through the exact
+  configured existing NGINX or Traefik IngressClass;
+- no app container port is exposed through a host port or NodePort by
+  default; and
+- Lightrail never guesses between or rewrites NGINX, Traefik, or another
+  ingress controller.
+
+For Fly, selected public apps use Fly Proxy and provider-managed TLS. Services
+not selected as public remain private within the environment's provider-native
+network boundary. Service-to-service discovery uses the deterministic Fly App
+name as `<owned-app>.internal`; original Compose service aliases are not
+preserved. Tunnels and private-only developer access are not implemented.
+
 ## 11. Deployment and readiness
 
 `lightrail up` must run these conceptual phases:
@@ -568,56 +913,103 @@ but must not rewrite an unknown host firewall.
 4. acquire the environment mutation lock;
 5. re-inspect provider/runtime state and produce the authoritative plan while
    holding that lock;
-6. display the locked plan;
+6. display the locked plan for human output, while JSON/plain automation uses
+   the matching `--dry-run` as its single-document plan review;
 7. build and resolve images;
 8. provision/bootstrap the target if needed;
-9. transfer images and generated material;
-10. apply the runtime and routing configuration;
+9. transfer images and generated material or push deterministic OCI
+   references;
+10. apply the Compose or provider-native runtime and routing configuration;
 11. wait for service and HTTPS readiness;
 12. record the healthy revision and print every app URL.
 
 `up --dry-run` remains read-only: it performs the fullest inspection and
 planning available without acquiring a lock, then exits. A real `up` never
 applies that pre-lock plan; it re-prepares everything under the lock.
+Real JSON/plain mutations reserve stdout for one final result rather than
+emitting two incompatible documents; their locked plan still participates in
+continuity checks and the operation journal.
 Destruction is also re-inspected and re-planned after locking. If its action
 contract changed while the user was reviewing or confirming it, `down` aborts
 and asks the user to rerun it rather than applying an unconfirmed plan.
+Plan continuity covers a canonical digest of the complete serialized
+`PlanResult`, including actions, dependencies, rollback metadata, and plugin
+metadata; matching only a plan ID or action summary is insufficient.
 
 Readiness succeeds only when:
 
-- every Compose service with a health check reports healthy;
-- every service without a health check remains running through a short
-  stability window;
+- on SSH/Hetzner, every Compose service with a health check reports healthy
+  and every service without one remains running through a short stability
+  window;
+- on Kubernetes, every applied long-running workload completes its
+  provider-native rollout and every Job completes; these waits run
+  concurrently under one runtime readiness deadline;
+- on Fly, every required Machine reaches the expected provider/runtime state;
 - every public app responds through its final HTTPS hostname with a valid
   certificate;
 - the default route probe receives a status below 500, allowing valid API
   responses such as 401, 403, or 404;
 - an app with `health_path` and `health_status` satisfies that stricter
-  requirement; and
-- Compose wait and HTTPS probe phases each use a default five-minute timeout.
+  requirement.
 
-HTTPS checks execute concurrently. Profiles/apps may change the path, expected
-status, interval, stability window, and timeouts. Because runtime apply and
-exposure readiness are separate plugin requests, five minutes is not a single
-wall-clock timeout for the entire `up` command.
+Runtime wait and HTTPS probe phases are independently bounded. HTTPS checks
+execute concurrently. Profiles/apps may change the path, expected status,
+interval, stability window, and supported timeouts. SSH/Hetzner Compose wait
+and HTTPS checks default to five minutes; Kubernetes
+`readiness_timeout_seconds` defaults to 300. A configured phase timeout is not
+a single wall-clock timeout for the entire `up` command.
+
+Core derives the surrounding protocol deadline from exact work units. Each
+locked-plan action or exact destroy selection receives one command phase plus
+one readiness phase, followed by a five-minute coordination margin; configured
+phase contributions are capped at 60 minutes and the complete request at 24
+hours. Provider inspection uses that explicit maximum because its result
+defines the previously unknown remote work count. Plugins must not hide
+additional sequential phase multipliers inside one planned action.
 
 ## 12. Repeated `up` and rollback
 
 Repeated `up` reconciles the current environment:
 
 - routes and hostnames stay stable;
-- Compose applies the new revision in place and removes orphans;
-- environment-scoped named volumes are preserved;
-- the previous healthy generated base, runtime override, and non-secret
-  manifest remain available while the new revision is checked.
+- SSH/Hetzner Compose applies the new revision in place and removes orphans;
+- Kubernetes and Fly reconcile deterministic provider-native resources;
+- environment-scoped named volumes, persistent volume claims, and Fly volumes
+  are preserved; and
+- SSH/Hetzner retain the previous generated deployment documents; native
+  providers use their locked pre-apply observations to define only the
+  rollback actions they explicitly support.
 
 Automatic rollback is the default.
 
+- The journal identifies every planned/completed action by plugin, capability,
+  exact plan ID, and action ID. `down` and `prune` journal the exact locked
+  plans and mark completion from returned destroy action journals; they assume
+  all planned actions completed only when destruction reports no remaining
+  state.
 - A failed initial deployment removes resources newly created by that
-  operation.
+  operation. Core passes the plugin's post-apply rediscovery state to
+  whole-capability cleanup when apply returned one, so cleanup is scoped to
+  what that attempt actually created; if apply failed before returning state,
+  the plugin must use the locked context and exact deterministic resource
+  identities to find only that attempt's resources.
+- Fly records provisional App, Machine, and volume identities during initial
+  creation so partial target cleanup stays exact. If exposure allocated a
+  shared IPv4 before a later failure, rollback releases that exact App/address
+  pair.
 - A failed update restores the previous generated Compose documents and
-  reapplies them where possible; previously loaded built images remain in the
-  remote Docker cache.
+  reapplies them where possible on SSH/Hetzner. Provider-native plugins
+  compensate their exact applied actions where supported.
+- Provider-native update restoration is not a blanket guarantee: core invokes
+  only rollback actions explicitly advertised in the locked plan/journal. An
+  unsupported or failed compensation is reported for explicit recovery.
+  A provider mutation must advertise either a supported exact inverse or an
+  unsupported contract with a safe reason; a potentially executed existing
+  Target or Runtime action with no contract is itself reported as incomplete
+  rollback.
+- Previously loaded built images remain in the remote Docker cache. OCI images
+  pushed for Kubernetes or Fly remain in the registry cache even when apply
+  fails or an environment is rolled back.
 - Transient failures use bounded retries with backoff; permanent validation or
   authorization failures fail immediately.
 - `--keep-failed` preserves failed resources for debugging and records the
@@ -629,7 +1021,10 @@ Followed logs handle Ctrl+C. During an in-flight `up`, Ctrl+C sends semantic
 `plugin.cancel`, waits for the active plugin to reach a safe stopping point,
 and then follows the normal failure and rollback path unless `--keep-failed`
 was selected. `down` uses the same safe-point cancellation mechanism and stops
-before beginning another destroy step.
+before beginning another destroy step. If apply returns a successful result
+concurrently with cancellation, core journals its exact returned post-state
+before entering rollback and never commits the cancelled revision as a
+success.
 
 Rollback cannot reverse:
 
@@ -646,8 +1041,8 @@ Brief container recreation downtime is acceptable in the MVP.
 
 ## 13. Concurrency
 
-Only one mutating operation (`up` or `down`) may own an overlapping lock scope
-at a time.
+Only one mutating operation (`up`, `down`, or `prune`) may own an overlapping
+lock scope at a time.
 
 - Target plugins must provide an operation-lock capability. The core must
   refuse an unsafe mutation when no authoritative lock is available.
@@ -667,6 +1062,22 @@ at a time.
   lock after bootstrap; a failed upgrade preserves the machine for explicit
   recovery. Project operations acquire machine locks in deterministic
   provider-ID order without serializing unrelated environment operations.
+- Kubernetes serializes every mutation for one immutable project through a
+  project-scoped `coordination.k8s.io/v1` Lease in the configured existing
+  control namespace. Lease acquisition and expiry use optimistic
+  `resourceVersion` continuity; an active owner heartbeats until release or
+  process loss, and same-owner reacquisition returns the identical live token.
+- Every owned Kubernetes namespace records that control namespace. Changing it
+  while the environment exists fails before mutation, preventing a different
+  Lease from silently replacing the original authority. Initial namespace
+  ownership uses an atomic create; `AlreadyExists` and lost-response recovery
+  continue only after exact ownership, control-namespace, and planned
+  spec-hash reinspection, never by applying over competing ownership.
+- Fly intentionally serializes all project mutations, including
+  current-environment `up`/`down`, behind one deterministic provider-visible
+  lock App and stopped sentinel Machine lease. The shared lock App is retained
+  during environment teardown. `lock_ttl_seconds`, default 3600, bounds stale
+  lease recovery; a process-local mutex alone is never authoritative.
 - A provisioning VM cannot normally be destroyed until its operation
   completes or fails.
 - Mutating commands wait for up to 30 seconds by default. `--lock-timeout`
@@ -676,8 +1087,10 @@ at a time.
 - If a machine-isolated remote lock authority is unavailable, bypassing it
   for provider-side destruction requires `down --force` and explicit
   confirmation. Force never bypasses a busy lock and is not available for the
-  shared generic SSH lock.
-- Remote locks must release when their owning process/SSH session ends.
+  shared generic SSH lock or environment-isolated Kubernetes/Fly targets.
+- Connection-scoped locks release with their owning process/SSH session.
+  Lease-backed locks stop heartbeating and become recoverable only under their
+  declared expiry/continuity rules.
 
 ## 14. Destruction
 
@@ -687,7 +1100,8 @@ default.
 Before changing anything it must:
 
 1. rediscover owned resources;
-2. display a destruction plan;
+2. prepare a destruction plan and display it for human output or every
+   `--dry-run`; JSON/plain real runs reserve stdout for the final result;
 3. require interactive confirmation, unless `--yes` was provided; and
 4. support `--dry-run` to stop after the plan.
 
@@ -699,6 +1113,17 @@ labels; unrelated and external images remain.
 
 For machine isolation it deletes the managed VM and all attached
 Lightrail-managed resources.
+
+For environment isolation, Kubernetes deletes only the exact owned namespace
+and therefore its owned workloads, Services, Ingresses, Secrets, jobs, and
+persistent volume claims. Fly deletes only the exact owned environment's Apps,
+Machines, and volumes. A normal App requires exact Machine ownership metadata;
+a zero-Machine interrupted-create orphan is eligible only when its stable
+project marker, deterministic project-network prefix, and captured App/network
+and volume IDs all remain continuous. An App name alone never authorizes
+deletion. Shared IPv4 and routing state are App-attached; the deterministic
+custom 6PN name is not a separately deleted resource. Neither path deletes
+registry images; Fly also retains the project lock App.
 
 `down --all` targets every labeled project environment discoverable through
 the selected profile's configured target and credentials, and requires
@@ -717,7 +1142,38 @@ does not imply `--yes`, and does not weaken ownership selectors. It permits
 provider-side deletion of labeled Hetzner servers and firewalls even when
 remote Compose cleanup cannot run. With project isolation the shared SSH host
 is always retained; if that host is unreachable, remote environment resources
-cannot be removed and require a later retry.
+cannot be removed and require a later retry. Environment-isolated Kubernetes
+and Fly profiles do not support `--force`.
+
+### 14.1 Expiry pruning
+
+`lightrail prune` is available only for environment-isolated provider plugins
+that advertise `dev.lightrail.selected-destroy.v1` and aggregate target,
+runtime, exposure, and DNS destruction in that one plugin.
+
+The command:
+
+1. performs project-wide inspection through the selected profile context or
+   account;
+2. accepts only environment-contract version 1 observations with an exact
+   immutable project ID, unique environment ID, and provider-visible expiry;
+3. selects only entries whose `expires_at_unix` is at or before the command's
+   captured current time;
+4. prepares an exact destructive plan, displaying it for human output or
+   every `--dry-run`;
+5. stops after the plan for `--dry-run`, otherwise requires confirmation or
+   `--yes`;
+6. takes the project mutation lock, reinspects against the same captured time,
+   and aborts if either the candidate set or the canonical digest of the full
+   serialized plan changed; and
+7. sends the exact selected IDs to the provider and requires no remaining
+   resources.
+
+The selected-destroy operation uses selection schema 1 with reason `expired`.
+It must never fall back to unselected `down --all`. Registry images, the
+Kubernetes cluster/control namespace/ingress components, and the Fly lock App
+remain. Cleanup is explicit; Lightrail does not run a background expiry
+controller.
 
 ## 15. Secrets
 
@@ -766,6 +1222,21 @@ plugin or core rejects the operation. `dev.lightrail.hetzner` declares only
 the required `hetzner-token`; `dev.lightrail.ssh` declares no secrets and uses
 the local OpenSSH client, optional key path, and SSH agent.
 
+`dev.lightrail.kubernetes` accepts only explicit application secret
+references needed by an `up`; it submits their values through `kubectl` stdin
+and never puts them in command arguments or generated diagnostic output. It
+uses the explicit `kubeconfig` setting when supplied, otherwise the narrowly
+forwarded `KUBECONFIG`/ordinary kubeconfig lookup. Local registry push
+credentials and the cluster's pull credentials are separate external
+prerequisites, not values copied automatically between those boundaries.
+Generated Opaque Secrets persist in the Kubernetes API until the environment
+namespace is deleted; API RBAC, audit policy, and etcd encryption are cluster
+operator responsibilities.
+
+`dev.lightrail.fly` declares the required `fly-token`. Core resolves that
+logical secret only for Fly capabilities and supplies it over JSON-RPC stdin;
+it is not inherited as an ambient `FLY_API_TOKEN`.
+
 Remote temporary environment files use mode `0600` and are removed after
 container creation. Values placed in container environment variables remain
 visible through normal privileged Docker inspection; file-mounted secrets
@@ -791,11 +1262,17 @@ The authoritative inputs and observations are:
 - committed project and plugin configuration;
 - deterministic environment identity;
 - provider resources labeled with ownership metadata; and
-- Docker/Compose resources labeled with ownership and revision metadata.
+- Docker/Compose, Kubernetes, or Fly resources labeled with ownership and
+  revision metadata.
 
 Labels must carry enough information to rediscover at least project ID,
 environment ID, profile, branch identity, resource role, managed ownership, and
 revision where relevant.
+
+Kubernetes project-wide discovery lists exact project-labeled namespaces and
+their owned resources through the selected context. Fly discovery queries
+provider resources visible through the selected organization and credential.
+Neither may treat `.lightrail/` as ownership authority.
 
 `.lightrail/` is only a cache and operation journal. Losing it must not prevent
 another developer or CI runner with the repository and credentials from
@@ -821,13 +1298,17 @@ External executable plugins provide capabilities such as:
   exposure, and IP-derived DNS;
 - `dev.lightrail.ssh`: generic SSH target and remote operation lock;
 - `dev.lightrail.hetzner`: Hetzner target and remote operation lock;
-- unimplemented extension points for future usage, tunnel, Fly.io,
-  Kubernetes, k3s, GitHub, GitLab, and remote-state plugins.
+- `dev.lightrail.kubernetes`: existing-cluster builder, target, runtime,
+  ingress/DNS, readiness, and Lease lock;
+- `dev.lightrail.fly`: agentless builder, target, runtime, Fly Proxy/DNS,
+  readiness, and provider-backed operation lock;
+- unimplemented extension points for future usage, tunnel, k3s, GitHub,
+  GitLab, and remote-state plugins.
 
 Bundled plugins must use the same versioned JSON-RPC-over-stdin/stdout contract
 as third-party plugins. Rust dynamic libraries are not a plugin ABI.
 
-The three MVP plugins ship with Lightrail and are resolved as sibling
+The five bundled plugins ship with Lightrail and are resolved as sibling
 executables. Their manifest ID and package version are verified during
 handshake. Bundled resolution uses a canonical absolute sibling path and
 fails closed when it is unavailable; it never searches `PATH`. Third-party
@@ -861,13 +1342,14 @@ See [plugin-protocol.md](plugin-protocol.md) for the implemented wire contract.
 ### 18.1 Commands
 
 ```text
-lightrail init [--from <file>] [--target ssh|hetzner] [--domain sslip.io|nip.io] [--profile <name>] [--force]
+lightrail init [--from <file>] [--target ssh|hetzner|kubernetes|fly] [--domain sslip.io|nip.io] [--profile <name>] [--force]
 lightrail profile add <name> [--from <profile>]|list|show <name>|remove <name>|default <name>
 lightrail up [--dry-run] [--keep-failed] [--lock-timeout <time>]
 lightrail status [--all]
 lightrail urls [--all]
 lightrail logs [service] [--follow] [--tail <count>]
 lightrail down [--all] [--dry-run] [--yes] [--force] [--lock-timeout <time>]
+lightrail prune [--dry-run] [--yes] [--lock-timeout <time>]
 lightrail doctor [--target]
 lightrail secret set <name> [--stdin]|list|delete <name>
 lightrail plugin install <source>|sync|list|inspect <id>|update <id>|remove <id>
@@ -886,23 +1368,23 @@ Global options:
 Important command options:
 
 ```text
--n, --dry-run          display a plan without mutation (`up`, `down`)
+-n, --dry-run          display a plan without mutation (`up`, `down`, `prune`)
 --keep-failed          preserve a failed deployment (`up`)
 -a, --all              act on project environments visible through the selected profile target
 --follow               stream logs
 --tail <count>          historical log records, default 100
---yes                  confirm destruction non-interactively
+--yes                  confirm destruction non-interactively (`down`, `prune`)
 --force                machine-only unavailable-lock recovery for destruction
 --lock-timeout <time>  mutation-lock wait, default 30 seconds
 ```
 
-Followed logs handle Ctrl+C. For an in-flight `up` or `down`, the CLI sends
-semantic operation cancellation, waits for the active plugin's safe stopping
-point, and then performs rollback or an orderly stop as applicable. The
-protocol client also cancels individually timed-out requests. Human-readable
-progress and errors go to stderr; command data and `--output json` output go
-to stdout. JSON log output is newline-delimited so followed logs remain
-streamable. Any unsuccessful operation exits non-zero.
+Followed logs handle Ctrl+C. For an in-flight `up`, `down`, or `prune`, the
+CLI sends semantic operation cancellation, waits for the active plugin's safe
+stopping point, and then performs rollback or an orderly stop as applicable.
+The protocol client also cancels individually timed-out requests.
+Human-readable progress and errors go to stderr; command data and `--output
+json` output go to stdout. JSON log output is newline-delimited so followed
+logs remain streamable. Any unsuccessful operation exits non-zero.
 
 ### 18.2 Command behavior
 
@@ -914,7 +1396,8 @@ streamable. Any unsuccessful operation exits non-zero.
   `add` clones the `--from`, globally selected, or default profile, in that
   order. `default` changes selection when `--profile` is omitted. Removal
   refuses to orphan discovered live environments.
-- `up`: plan, build, transfer, deploy, verify, then print all app URLs.
+- `up`: plan, build, transfer or push, deploy, verify, then print all app
+  URLs.
 - `up --dry-run`: perform discovery and validation and print the complete
   obtainable plan without provisioning, building, or mutating.
 - `status`: rediscover and summarize the current environment.
@@ -926,13 +1409,26 @@ streamable. Any unsuccessful operation exits non-zero.
   returns every labeled machine visible to that provider configuration and
   core fans out downstream runtime inspection; an unreachable machine remains
   visible as a degraded endpoint-free summary instead of hiding the rest.
-- `logs [service] --follow`: read or stream logs from the selected environment;
-  service is optional when the runtime supports aggregate logs.
+  Environment-isolated providers return the exact owned Kubernetes namespaces
+  or Fly aggregates visible through the selected context/account, including
+  provider expiry metadata when present.
+- `logs [service]`: read logs when the selected runtime implements them.
+  SSH/Hetzner Compose supports historical and followed logs. Kubernetes
+  supports historical logs but returns `unsupported` for `--follow`; Fly
+  currently returns `unsupported` for both historical and followed logs.
+  Service is optional when the runtime supports aggregate logs.
 - `down`: execute the destruction contract in section 14.
   Declining the pre-mutation confirmation is a successful no-op.
-- `doctor`: validate Git, the Docker client and daemon, Buildx, Compose, and
-  OpenSSH. `doctor --target` additionally invokes target inspection with the
-  selected profile and its credentials.
+- `prune`: for an environment-isolated Kubernetes/Fly profile, discover and
+  plan the exact expired project environments visible through that selected
+  provider boundary. It requires a feature-capable aggregate provider plugin,
+  explicit confirmation unless `--yes` is set, and a project lock with exact
+  reinspection. `--dry-run` is read-only.
+- `doctor`: validate the common local Git, Docker client/daemon, Buildx, and
+  Compose prerequisites. Target-specific validation adds OpenSSH for
+  SSH/Hetzner, `kubectl` and the selected context for Kubernetes, or Fly API
+  access for Fly. `doctor --target` invokes target inspection with the
+  selected profile and only its required credentials.
 - `secret`: manage named secret references through the configured local secret
   store. A missing secret entered during another interactive command is cached
   only for that command and is never persisted implicitly.
@@ -953,16 +1449,24 @@ The initial supported developer platforms are:
 
 Native Windows is deferred.
 
-Deployment prerequisites are Git, Docker Engine or Docker Desktop with Buildx,
-and OpenSSH. `doctor` verifies them before deployment.
+Common deployment prerequisites are Git and Docker Engine or Docker Desktop
+with Buildx. SSH/Hetzner additionally require OpenSSH. Kubernetes requires
+`kubectl`, an existing explicit context, and an authenticated OCI registry.
+Fly requires provider API access through `fly-token`. `doctor` and provider
+preflight verify the applicable subset before mutation.
 
-Remote targets are Linux `amd64` or `arm64`. Generic automatic bootstrap
+SSH/Hetzner targets are Linux `amd64` or `arm64`. Generic automatic bootstrap
 initially supports Ubuntu and Debian families. Hetzner uses a supported Ubuntu
-image by default.
+image by default. Kubernetes supports Ready, schedulable Linux `amd64` and
+`arm64` nodes; Fly uses the configured platform, initially `linux/amd64`.
 
-Lightrail detects remote architecture and builds only that platform. A
-cross-architecture build uses Buildx/QEMU. If the local builder cannot provide
-the target platform, deployment fails with exact remediation instructions.
+SSH/Hetzner detect remote architecture. Kubernetes discovers architectures
+from Ready, schedulable nodes unless `platforms` is explicit. An explicit list
+must be a subset of the observed set and constrains both Buildx output and Pod
+scheduling, using a node selector for one architecture or required node
+affinity for several. Fly uses its explicit `platform`. A cross-architecture
+build uses Buildx/QEMU. If the local builder cannot provide a required
+platform, deployment fails with exact remediation instructions.
 
 ## 20. Deferred roadmap
 
@@ -970,12 +1474,13 @@ None of the features below is implemented. The plugin and profile model
 preserves extension points for:
 
 - authenticated private tunnels with no public inbound application ports;
-- Fly.io through an agentless target plugin;
-- Kubernetes and k3s runtimes, ingress, and readiness;
+- k3s cluster provisioning and lifecycle;
+- Kubernetes cluster/node provisioning and shared-component setup or upgrade;
+- a background/automatic expiry controller;
 - GitHub/GitLab pull-request event automation while retaining the current-CWD
   workflow;
 - provider-aware usage and cost reporting;
-- blue/green or rolling updates;
+- user-selectable blue/green, canary, or advanced rollout strategies;
 - custom DNS plugins outside the MVP;
 - remote state backends; and
 - native Windows developer support.

@@ -16,7 +16,9 @@ use serde::{Deserialize, Serialize};
 use crate::{
     compose::{ComposeInspector, ComposeInventory, ServiceInventory},
     error::CliError,
-    plugin_host::{COMPOSE_PLUGIN_ID, HETZNER_PLUGIN_ID, SSH_PLUGIN_ID},
+    plugin_host::{
+        COMPOSE_PLUGIN_ID, FLY_PLUGIN_ID, HETZNER_PLUGIN_ID, KUBERNETES_PLUGIN_ID, SSH_PLUGIN_ID,
+    },
     plugin_registry::PluginLock,
     process::TokioCommandRunner,
     workspace::{CONFIG_FILE, ProjectPaths},
@@ -55,7 +57,7 @@ pub struct InitAnswers {
     pub compose: Vec<PathBuf>,
     /// Target provider. Defaults to generic SSH.
     pub target: Option<TargetKind>,
-    /// Isolation override. Defaults to project for SSH and machine for Hetzner.
+    /// Isolation override. Defaults to the selected target's supported boundary.
     pub isolation: Option<Isolation>,
     /// Explicit public application routes.
     #[serde(default)]
@@ -95,6 +97,10 @@ pub enum TargetKind {
     Ssh,
     /// A dedicated Hetzner Cloud server.
     Hetzner,
+    /// An existing Kubernetes cluster selected through kubeconfig.
+    Kubernetes,
+    /// Agentless Fly.io Apps and Machines.
+    Fly,
 }
 
 impl TargetKind {
@@ -102,6 +108,8 @@ impl TargetKind {
         match self {
             Self::Ssh => SSH_PLUGIN_ID,
             Self::Hetzner => HETZNER_PLUGIN_ID,
+            Self::Kubernetes => KUBERNETES_PLUGIN_ID,
+            Self::Fly => FLY_PLUGIN_ID,
         }
     }
 
@@ -109,6 +117,7 @@ impl TargetKind {
         match self {
             Self::Ssh => Isolation::Project,
             Self::Hetzner => Isolation::Machine,
+            Self::Kubernetes | Self::Fly => Isolation::Environment,
         }
     }
 }
@@ -118,6 +127,8 @@ impl fmt::Display for TargetKind {
         match self {
             Self::Ssh => formatter.write_str("Generic SSH host"),
             Self::Hetzner => formatter.write_str("Hetzner Cloud"),
+            Self::Kubernetes => formatter.write_str("Existing Kubernetes cluster"),
+            Self::Fly => formatter.write_str("Fly.io"),
         }
     }
 }
@@ -250,14 +261,24 @@ pub async fn initialize_from_inventory(
     let initialized_profile = config
         .profile(&options.profile)
         .expect("the initial profile was inserted above");
-    let dns_domain = initialized_profile
-        .settings
-        .get("dns")
-        .and_then(toml::Value::as_table)
-        .and_then(|settings| settings.get("domain"))
-        .and_then(toml::Value::as_str)
-        .unwrap_or("sslip.io")
-        .to_owned();
+    let dns_domain = match target {
+        TargetKind::Fly => "fly.dev",
+        TargetKind::Kubernetes => initialized_profile
+            .settings
+            .get("target")
+            .and_then(toml::Value::as_table)
+            .and_then(|settings| settings.get("dns_domain"))
+            .and_then(toml::Value::as_str)
+            .unwrap_or("sslip.io"),
+        TargetKind::Ssh | TargetKind::Hetzner => initialized_profile
+            .settings
+            .get("dns")
+            .and_then(toml::Value::as_table)
+            .and_then(|settings| settings.get("domain"))
+            .and_then(toml::Value::as_str)
+            .unwrap_or("sslip.io"),
+    }
+    .to_owned();
     let target_detail = summarize_target(target, initialized_profile.settings.get("target"));
     Ok(InitSummary {
         config_path: paths.config,
@@ -297,6 +318,28 @@ fn summarize_target(target: TargetKind, settings: Option<&toml::Value>) -> Optio
                     |location| format!("location {location}"),
                 );
             Some(format!("{server_type}, {location}"))
+        }
+        TargetKind::Kubernetes => {
+            let context = settings.get("context").and_then(toml::Value::as_str)?;
+            let ingress_class = settings
+                .get("ingress_class")
+                .and_then(toml::Value::as_str)
+                .unwrap_or("not configured");
+            Some(format!("context {context}, ingress class {ingress_class}"))
+        }
+        TargetKind::Fly => {
+            let organization = settings
+                .get("organization")
+                .and_then(toml::Value::as_str)
+                .unwrap_or("personal");
+            let region = settings
+                .get("region")
+                .and_then(toml::Value::as_str)
+                .map_or_else(
+                    || "provider-selected region".to_owned(),
+                    |region| format!("region {region}"),
+                );
+            Some(format!("organization {organization}, {region}"))
         }
     }
 }
@@ -447,7 +490,12 @@ fn choose_target(answer: Option<TargetKind>, interactive: bool) -> Result<Target
     if !interactive {
         return Ok(TargetKind::Ssh);
     }
-    let targets = [TargetKind::Ssh, TargetKind::Hetzner];
+    let targets = [
+        TargetKind::Ssh,
+        TargetKind::Hetzner,
+        TargetKind::Kubernetes,
+        TargetKind::Fly,
+    ];
     let selected = Select::with_theme(&ColorfulTheme::default())
         .with_prompt("Deployment target")
         .items(&targets)
@@ -464,6 +512,7 @@ fn validate_target_isolation(target: TargetKind, isolation: Isolation) -> Result
     let supported = match target {
         TargetKind::Ssh => "project",
         TargetKind::Hetzner => "machine",
+        TargetKind::Kubernetes | TargetKind::Fly => "environment",
     };
     Err(CliError::Config(format!(
         "{target} supports only `{supported}` isolation"
@@ -661,13 +710,31 @@ fn build_pipeline(target: TargetKind) -> Result<PluginPipeline, CliError> {
     let plugin = |identifier: &str| {
         PluginId::new(identifier).map_err(|error| CliError::Config(error.to_string()))
     };
+    let provider_native = matches!(target, TargetKind::Kubernetes | TargetKind::Fly);
+    let provider = target.target_plugin();
     Ok(PluginPipeline {
         source: plugin(COMPOSE_PLUGIN_ID)?,
-        builder: plugin(COMPOSE_PLUGIN_ID)?,
-        target: plugin(target.target_plugin())?,
-        runtime: plugin(COMPOSE_PLUGIN_ID)?,
-        exposure: plugin(COMPOSE_PLUGIN_ID)?,
-        dns: plugin(COMPOSE_PLUGIN_ID)?,
+        builder: plugin(if provider_native {
+            provider
+        } else {
+            COMPOSE_PLUGIN_ID
+        })?,
+        target: plugin(provider)?,
+        runtime: plugin(if provider_native {
+            provider
+        } else {
+            COMPOSE_PLUGIN_ID
+        })?,
+        exposure: plugin(if provider_native {
+            provider
+        } else {
+            COMPOSE_PLUGIN_ID
+        })?,
+        dns: plugin(if provider_native {
+            provider
+        } else {
+            COMPOSE_PLUGIN_ID
+        })?,
     })
 }
 
@@ -677,26 +744,39 @@ fn build_settings(
     answers: BTreeMap<String, toml::Value>,
     interactive: bool,
 ) -> Result<BTreeMap<String, toml::Value>, CliError> {
+    let explicit_target_dns_domain = answers
+        .get("target")
+        .and_then(toml::Value::as_table)
+        .map(|target| optional_string_setting(target, "dns_domain", "settings.target.dns_domain"))
+        .transpose()?
+        .flatten();
+    let explicit_target_declares_dns = answers
+        .get("target")
+        .and_then(toml::Value::as_table)
+        .is_some_and(|target| target.contains_key("dns_domain"));
     let target_defaults = match target {
         TargetKind::Ssh => ssh_settings(answers.get("target"), interactive)?,
         TargetKind::Hetzner => hetzner_settings(answers.get("target"), interactive)?,
+        TargetKind::Kubernetes => kubernetes_settings(answers.get("target"), interactive)?,
+        TargetKind::Fly => fly_settings(answers.get("target"))?,
+    };
+    let (exposure_defaults, dns_defaults) = match target {
+        TargetKind::Ssh | TargetKind::Hetzner => (
+            toml::Table::from_iter([
+                ("mode".into(), toml::Value::String("public".into())),
+                ("tls".into(), toml::Value::String("acme-http-01".into())),
+            ]),
+            toml::Table::from_iter([
+                ("domain".into(), toml::Value::String("sslip.io".into())),
+                ("encoding".into(), toml::Value::String("hex-ipv4".into())),
+            ]),
+        ),
+        TargetKind::Kubernetes | TargetKind::Fly => (toml::Table::new(), toml::Table::new()),
     };
     let mut settings = BTreeMap::from([
         ("target".into(), target_defaults),
-        (
-            "exposure".into(),
-            toml::Value::Table(toml::Table::from_iter([
-                ("mode".into(), toml::Value::String("public".into())),
-                ("tls".into(), toml::Value::String("acme-http-01".into())),
-            ])),
-        ),
-        (
-            "dns".into(),
-            toml::Value::Table(toml::Table::from_iter([
-                ("domain".into(), toml::Value::String("sslip.io".into())),
-                ("encoding".into(), toml::Value::String("hex-ipv4".into())),
-            ])),
-        ),
+        ("exposure".into(), toml::Value::Table(exposure_defaults)),
+        ("dns".into(), toml::Value::Table(dns_defaults)),
     ]);
 
     for (capability, answer) in answers {
@@ -707,20 +787,703 @@ fn build_settings(
             answer,
         );
     }
+    match target {
+        TargetKind::Hetzner => {
+            enforce_target_secret_reference(&mut settings, "hetzner-token")?;
+        }
+        TargetKind::Fly => {
+            enforce_target_secret_reference(&mut settings, "fly-token")?;
+        }
+        TargetKind::Ssh | TargetKind::Kubernetes => {}
+    }
 
     let dns = settings
         .get_mut("dns")
         .and_then(toml::Value::as_table_mut)
         .ok_or_else(|| CliError::Config("`settings.dns` must be a table".into()))?;
+    if target == TargetKind::Fly {
+        if dns_domain.is_some() || !dns.is_empty() || explicit_target_declares_dns {
+            return Err(CliError::Config(
+                "Fly.io uses its native `fly.dev` hostname; custom DNS settings and `--domain` are not applicable"
+                    .into(),
+            ));
+        }
+        return Ok(settings);
+    }
+    let capability_dns_domain = optional_string_setting(dns, "domain", "settings.dns.domain")?;
+    if target == TargetKind::Kubernetes {
+        if let Some(key) = dns
+            .keys()
+            .find(|key| !matches!(key.as_str(), "domain" | "encoding"))
+        {
+            return Err(CliError::Config(format!(
+                "unknown Kubernetes DNS setting `settings.dns.{key}`"
+            )));
+        }
+        if let Some(encoding) = dns.get("encoding") {
+            if encoding.as_str() != Some("hex-ipv4") {
+                return Err(CliError::Config(
+                    "`settings.dns.encoding` must be `hex-ipv4`".into(),
+                ));
+            }
+        }
+    }
+    if target == TargetKind::Kubernetes
+        && dns_domain.is_none()
+        && explicit_target_dns_domain.is_some()
+        && capability_dns_domain.is_some()
+        && explicit_target_dns_domain != capability_dns_domain
+    {
+        return Err(CliError::Config(
+            "`settings.target.dns_domain` and `settings.dns.domain` disagree; keep one value or make them identical"
+                .into(),
+        ));
+    }
     let effective_domain = dns_domain
-        .or_else(|| dns.get("domain").and_then(toml::Value::as_str))
+        .or(explicit_target_dns_domain.as_deref())
+        .or(capability_dns_domain.as_deref())
         .unwrap_or("sslip.io");
-    dns.insert(
-        "domain".into(),
-        toml::Value::String(validate_dns_domain(effective_domain)?),
-    );
-    dns.insert("encoding".into(), toml::Value::String("hex-ipv4".into()));
+    let effective_domain = validate_dns_domain(effective_domain)?;
+    if target == TargetKind::Kubernetes {
+        // The Kubernetes executable owns target, runtime, exposure, and DNS
+        // as one aggregate plugin. Core merges settings for those capability
+        // slots before every request, so legacy Compose DNS fields would
+        // become unknown Kubernetes settings. Accept the old answer shape as
+        // input, normalize it into the native target field, and keep the DNS
+        // capability table empty.
+        dns.clear();
+        let target_settings = settings
+            .get_mut("target")
+            .and_then(toml::Value::as_table_mut)
+            .ok_or_else(|| CliError::Config("`settings.target` must be a table".into()))?;
+        target_settings.insert("dns_domain".into(), toml::Value::String(effective_domain));
+    } else {
+        dns.insert("domain".into(), toml::Value::String(effective_domain));
+        dns.insert("encoding".into(), toml::Value::String("hex-ipv4".into()));
+    }
     Ok(settings)
+}
+
+fn optional_string_setting(
+    table: &toml::Table,
+    key: &str,
+    field: &str,
+) -> Result<Option<String>, CliError> {
+    match table.get(key) {
+        None => Ok(None),
+        Some(toml::Value::String(value)) if !value.trim().is_empty() => {
+            Ok(Some(value.trim().to_owned()))
+        }
+        Some(_) => Err(CliError::Config(format!(
+            "`{field}` must be a non-empty string"
+        ))),
+    }
+}
+
+fn enforce_target_secret_reference(
+    settings: &mut BTreeMap<String, toml::Value>,
+    secret: &str,
+) -> Result<(), CliError> {
+    let target = settings
+        .get_mut("target")
+        .and_then(toml::Value::as_table_mut)
+        .ok_or_else(|| CliError::Config("`settings.target` must be a table".into()))?;
+    target.insert(
+        "token".into(),
+        toml::Value::Table(toml::Table::from_iter([(
+            "secret".into(),
+            toml::Value::String(secret.to_owned()),
+        )])),
+    );
+    Ok(())
+}
+
+fn kubernetes_settings(
+    supplied: Option<&toml::Value>,
+    interactive: bool,
+) -> Result<toml::Value, CliError> {
+    let mut table = supplied_table(supplied, "settings.target")?;
+    let context = required_setting(&table, "context", interactive, "Kubernetes context", None)?;
+    let registry = required_setting(
+        &table,
+        "registry",
+        interactive,
+        "OCI registry host",
+        Some("ghcr.io"),
+    )?;
+    let repository = required_setting(
+        &table,
+        "repository",
+        interactive,
+        "OCI repository prefix",
+        None,
+    )?;
+    let ingress_class = required_setting(
+        &table,
+        "ingress_class",
+        interactive,
+        "Existing Kubernetes IngressClass",
+        None,
+    )?;
+    let ingress_service_namespace = required_setting(
+        &table,
+        "ingress_service_namespace",
+        interactive,
+        "Namespace of the LoadBalancer Service backing that IngressClass",
+        None,
+    )?;
+    let ingress_service_name = required_setting(
+        &table,
+        "ingress_service_name",
+        interactive,
+        "Name of the LoadBalancer Service backing that IngressClass",
+        None,
+    )?;
+
+    if let Some(kubeconfig) = table.get("kubeconfig").and_then(toml::Value::as_str) {
+        if !Path::new(kubeconfig).is_absolute() {
+            return Err(CliError::Config(
+                "`settings.target.kubeconfig` must be an absolute path".into(),
+            ));
+        }
+    }
+
+    table.insert("context".into(), toml::Value::String(context));
+    table.insert("registry".into(), toml::Value::String(registry));
+    table.insert("repository".into(), toml::Value::String(repository));
+    table.insert("ingress_class".into(), toml::Value::String(ingress_class));
+    table.insert(
+        "ingress_service_namespace".into(),
+        toml::Value::String(ingress_service_namespace),
+    );
+    table.insert(
+        "ingress_service_name".into(),
+        toml::Value::String(ingress_service_name),
+    );
+    insert_default_string(&mut table, "namespace_prefix", "lr");
+    insert_default_string(&mut table, "control_namespace", "lightrail-system");
+    insert_default_string(&mut table, "dns_domain", "sslip.io");
+    insert_default_string(&mut table, "cluster_issuer", "letsencrypt");
+    insert_default_integer(&mut table, "replicas", 1);
+    insert_default_integer(&mut table, "ttl_hours", 72);
+    insert_default_integer(&mut table, "command_timeout_seconds", 300);
+    insert_default_integer(&mut table, "readiness_timeout_seconds", 300);
+    validate_kubernetes_init_settings(&table)?;
+    Ok(toml::Value::Table(table))
+}
+
+fn fly_settings(supplied: Option<&toml::Value>) -> Result<toml::Value, CliError> {
+    let mut table = supplied_table(supplied, "settings.target")?;
+    insert_default_string(&mut table, "organization", "personal");
+    insert_default_string(&mut table, "registry", "registry.fly.io");
+    insert_default_string(&mut table, "platform", "linux/amd64");
+    insert_default_string(&mut table, "app_prefix", "lr");
+    insert_default_string(&mut table, "cpu_kind", "shared");
+    insert_default_integer(&mut table, "cpus", 1);
+    insert_default_integer(&mut table, "memory_mb", 256);
+    insert_default_integer(&mut table, "ttl_hours", 72);
+    insert_default_integer(&mut table, "lock_ttl_seconds", 3600);
+    table
+        .entry("auto_stop")
+        .or_insert(toml::Value::Boolean(true));
+    table.insert(
+        "token".into(),
+        toml::Value::Table(toml::Table::from_iter([(
+            "secret".into(),
+            toml::Value::String("fly-token".into()),
+        )])),
+    );
+    validate_fly_init_settings(&table)?;
+    Ok(toml::Value::Table(table))
+}
+
+fn supplied_table(supplied: Option<&toml::Value>, field: &str) -> Result<toml::Table, CliError> {
+    match supplied {
+        None => Ok(toml::Table::new()),
+        Some(toml::Value::Table(table)) => Ok(table.clone()),
+        Some(_) => Err(CliError::Config(format!("`{field}` must be a table"))),
+    }
+}
+
+fn required_setting(
+    table: &toml::Table,
+    key: &str,
+    interactive: bool,
+    prompt: &str,
+    default: Option<&str>,
+) -> Result<String, CliError> {
+    if let Some(value) = table
+        .get(key)
+        .and_then(toml::Value::as_str)
+        .filter(|value| !value.trim().is_empty())
+    {
+        return Ok(value.trim().to_owned());
+    }
+    if !interactive {
+        return Err(CliError::Config(format!(
+            "Kubernetes init needs non-empty `settings.target.{key}`"
+        )));
+    }
+    let theme = ColorfulTheme::default();
+    let mut input = Input::<String>::with_theme(&theme).with_prompt(prompt);
+    if let Some(default) = default {
+        input = input.default(default.to_owned());
+    }
+    let value = input
+        .interact_text()
+        .map_err(|error| prompt_error(&error))?;
+    if value.trim().is_empty() {
+        return Err(CliError::Config(format!(
+            "`settings.target.{key}` must not be empty"
+        )));
+    }
+    Ok(value.trim().to_owned())
+}
+
+fn insert_default_string(table: &mut toml::Table, key: &str, value: &str) {
+    table
+        .entry(key)
+        .or_insert_with(|| toml::Value::String(value.to_owned()));
+}
+
+fn insert_default_integer(table: &mut toml::Table, key: &str, value: i64) {
+    table.entry(key).or_insert(toml::Value::Integer(value));
+}
+
+fn validate_kubernetes_init_settings(table: &toml::Table) -> Result<(), CliError> {
+    const ALLOWED: &[&str] = &[
+        "context",
+        "kubeconfig",
+        "registry",
+        "repository",
+        "ingress_class",
+        "ingress_service_namespace",
+        "ingress_service_name",
+        "namespace_prefix",
+        "control_namespace",
+        "dns_domain",
+        "cluster_issuer",
+        "image_pull_secret",
+        "platforms",
+        "replicas",
+        "ttl_hours",
+        "traefik_http_entrypoint",
+        "traefik_https_entrypoint",
+        "command_timeout_seconds",
+        "readiness_timeout_seconds",
+    ];
+    if let Some(key) = table.keys().find(|key| !ALLOWED.contains(&key.as_str())) {
+        return Err(CliError::Config(format!(
+            "unknown Kubernetes setting `settings.target.{key}`"
+        )));
+    }
+
+    let context = provider_string(table, "context", "settings.target.context")?;
+    validate_safe_provider_argument(context, "settings.target.context", 253)?;
+
+    if let Some(kubeconfig) =
+        optional_provider_string(table, "kubeconfig", "settings.target.kubeconfig")?
+    {
+        let path = Path::new(kubeconfig);
+        if !path.is_absolute()
+            || path
+                .components()
+                .any(|component| matches!(component, std::path::Component::ParentDir))
+            || kubeconfig.chars().any(char::is_control)
+        {
+            return Err(CliError::Config(
+                "`settings.target.kubeconfig` must be an absolute normalized path without control characters"
+                    .into(),
+            ));
+        }
+    }
+
+    let registry = provider_string(table, "registry", "settings.target.registry")?;
+    validate_registry_setting(registry)?;
+    let repository = provider_string(table, "repository", "settings.target.repository")?;
+    validate_repository_setting(repository)?;
+    validate_dns_subdomain_setting(
+        provider_string(table, "ingress_class", "settings.target.ingress_class")?,
+        "settings.target.ingress_class",
+    )?;
+    validate_dns_subdomain_setting(
+        provider_string(
+            table,
+            "ingress_service_namespace",
+            "settings.target.ingress_service_namespace",
+        )?,
+        "settings.target.ingress_service_namespace",
+    )?;
+    validate_dns_label_setting(
+        provider_string(
+            table,
+            "ingress_service_name",
+            "settings.target.ingress_service_name",
+        )?,
+        "settings.target.ingress_service_name",
+    )?;
+    let cleartext_entrypoint = optional_provider_string(
+        table,
+        "traefik_http_entrypoint",
+        "settings.target.traefik_http_entrypoint",
+    )?
+    .unwrap_or("web");
+    let tls_entrypoint = optional_provider_string(
+        table,
+        "traefik_https_entrypoint",
+        "settings.target.traefik_https_entrypoint",
+    )?
+    .unwrap_or("websecure");
+    validate_dns_label_setting(
+        cleartext_entrypoint,
+        "settings.target.traefik_http_entrypoint",
+    )?;
+    validate_dns_label_setting(tls_entrypoint, "settings.target.traefik_https_entrypoint")?;
+    if cleartext_entrypoint == tls_entrypoint {
+        return Err(CliError::Config(
+            "Kubernetes Traefik HTTP and HTTPS entrypoints must be distinct".into(),
+        ));
+    }
+    let namespace_prefix = provider_string(
+        table,
+        "namespace_prefix",
+        "settings.target.namespace_prefix",
+    )?;
+    validate_dns_label_setting(namespace_prefix, "settings.target.namespace_prefix")?;
+    if namespace_prefix.len() > 32 {
+        return Err(CliError::Config(
+            "`settings.target.namespace_prefix` must be at most 32 characters".into(),
+        ));
+    }
+    validate_dns_subdomain_setting(
+        provider_string(
+            table,
+            "control_namespace",
+            "settings.target.control_namespace",
+        )?,
+        "settings.target.control_namespace",
+    )?;
+    let dns_domain = provider_string(table, "dns_domain", "settings.target.dns_domain")?;
+    if !matches!(dns_domain, "sslip.io" | "nip.io") {
+        return Err(CliError::Config(
+            "`settings.target.dns_domain` must be `sslip.io` or `nip.io`".into(),
+        ));
+    }
+    validate_dns_subdomain_setting(
+        provider_string(table, "cluster_issuer", "settings.target.cluster_issuer")?,
+        "settings.target.cluster_issuer",
+    )?;
+    if let Some(secret) = optional_provider_string(
+        table,
+        "image_pull_secret",
+        "settings.target.image_pull_secret",
+    )? {
+        validate_dns_subdomain_setting(secret, "settings.target.image_pull_secret")?;
+    }
+    if let Some(platforms) = table.get("platforms") {
+        let platforms = platforms.as_array().ok_or_else(|| {
+            CliError::Config("`settings.target.platforms` must be an array of strings".into())
+        })?;
+        let mut seen = std::collections::BTreeSet::new();
+        for platform in platforms {
+            let platform = platform.as_str().ok_or_else(|| {
+                CliError::Config("`settings.target.platforms` entries must be strings".into())
+            })?;
+            if !matches!(platform, "linux/amd64" | "linux/arm64") || !seen.insert(platform) {
+                return Err(CliError::Config(
+                    "`settings.target.platforms` may contain unique `linux/amd64` and `linux/arm64` entries only"
+                        .into(),
+                ));
+            }
+        }
+    }
+    validate_integer_range(table, "replicas", 1, 100)?;
+    validate_integer_range(table, "ttl_hours", 1, 8_760)?;
+    validate_integer_range(table, "command_timeout_seconds", 1, 3_600)?;
+    validate_integer_range(table, "readiness_timeout_seconds", 1, 3_600)?;
+    Ok(())
+}
+
+fn validate_fly_init_settings(table: &toml::Table) -> Result<(), CliError> {
+    const ALLOWED: &[&str] = &[
+        "organization",
+        "region",
+        "token",
+        "registry",
+        "platform",
+        "app_prefix",
+        "cpu_kind",
+        "cpus",
+        "memory_mb",
+        "auto_stop",
+        "lock_ttl_seconds",
+        "ttl_hours",
+        "volume_size_gb",
+        "command_timeout_seconds",
+        "readiness_timeout_seconds",
+    ];
+    if let Some(key) = table.keys().find(|key| !ALLOWED.contains(&key.as_str())) {
+        return Err(CliError::Config(format!(
+            "unknown Fly.io setting `settings.target.{key}`"
+        )));
+    }
+
+    validate_fly_slug(
+        provider_string(table, "organization", "settings.target.organization")?,
+        "settings.target.organization",
+        128,
+    )?;
+    if let Some(region) = optional_provider_string(table, "region", "settings.target.region")? {
+        validate_fly_slug(region, "settings.target.region", 16)?;
+    }
+    validate_fly_slug(
+        provider_string(table, "app_prefix", "settings.target.app_prefix")?,
+        "settings.target.app_prefix",
+        16,
+    )?;
+    let registry = provider_string(table, "registry", "settings.target.registry")?;
+    if registry != "registry.fly.io" {
+        return Err(CliError::Config(
+            "`settings.target.registry` must be `registry.fly.io` for Fly.io".into(),
+        ));
+    }
+    let platform = provider_string(table, "platform", "settings.target.platform")?;
+    if !matches!(platform, "linux/amd64" | "linux/arm64") {
+        return Err(CliError::Config(
+            "`settings.target.platform` must be `linux/amd64` or `linux/arm64`".into(),
+        ));
+    }
+    let cpu_kind = provider_string(table, "cpu_kind", "settings.target.cpu_kind")?;
+    if cpu_kind.trim().is_empty() || cpu_kind.chars().any(char::is_control) {
+        return Err(CliError::Config(
+            "`settings.target.cpu_kind` must be a non-empty safe string".into(),
+        ));
+    }
+    validate_integer_range(table, "cpus", 1, i64::from(u16::MAX))?;
+    let memory_mb = validate_integer_range(table, "memory_mb", 256, i64::from(u32::MAX))?;
+    if memory_mb % 256 != 0 {
+        return Err(CliError::Config(
+            "`settings.target.memory_mb` must be a multiple of 256".into(),
+        ));
+    }
+    provider_boolean(table, "auto_stop", "settings.target.auto_stop")?;
+    let lock_ttl = validate_integer_range(table, "lock_ttl_seconds", 60, 86_400)?;
+    validate_integer_range(table, "ttl_hours", 1, i64::MAX)?;
+    if table.contains_key("volume_size_gb") {
+        validate_integer_range(table, "volume_size_gb", 1, i64::from(u32::MAX))?;
+    }
+    let command_timeout = if table.contains_key("command_timeout_seconds") {
+        validate_integer_range(table, "command_timeout_seconds", 10, 3_000)?
+    } else {
+        300
+    };
+    let readiness_timeout = if table.contains_key("readiness_timeout_seconds") {
+        validate_integer_range(table, "readiness_timeout_seconds", 10, 3_000)?
+    } else {
+        300
+    };
+    if lock_ttl <= command_timeout.max(readiness_timeout).saturating_add(180) {
+        return Err(CliError::Config(
+            "`settings.target.lock_ttl_seconds` must exceed command/readiness timeouts by more than 180 seconds"
+                .into(),
+        ));
+    }
+    Ok(())
+}
+
+fn provider_string<'a>(
+    table: &'a toml::Table,
+    key: &str,
+    field: &str,
+) -> Result<&'a str, CliError> {
+    optional_provider_string(table, key, field)?
+        .ok_or_else(|| CliError::Config(format!("`{field}` must be a non-empty string")))
+}
+
+fn optional_provider_string<'a>(
+    table: &'a toml::Table,
+    key: &str,
+    field: &str,
+) -> Result<Option<&'a str>, CliError> {
+    match table.get(key) {
+        None => Ok(None),
+        Some(toml::Value::String(value))
+            if !value.is_empty()
+                && value == value.trim()
+                && !value.chars().any(char::is_control) =>
+        {
+            Ok(Some(value))
+        }
+        Some(_) => Err(CliError::Config(format!(
+            "`{field}` must be a non-empty string without surrounding whitespace or control characters"
+        ))),
+    }
+}
+
+fn provider_boolean(table: &toml::Table, key: &str, field: &str) -> Result<bool, CliError> {
+    table
+        .get(key)
+        .and_then(toml::Value::as_bool)
+        .ok_or_else(|| CliError::Config(format!("`{field}` must be a boolean")))
+}
+
+fn validate_integer_range(
+    table: &toml::Table,
+    key: &str,
+    minimum: i64,
+    maximum: i64,
+) -> Result<i64, CliError> {
+    let field = format!("settings.target.{key}");
+    let value = table
+        .get(key)
+        .and_then(toml::Value::as_integer)
+        .ok_or_else(|| CliError::Config(format!("`{field}` must be an integer")))?;
+    if !(minimum..=maximum).contains(&value) {
+        return Err(CliError::Config(format!(
+            "`{field}` must be between {minimum} and {maximum}"
+        )));
+    }
+    Ok(value)
+}
+
+fn validate_safe_provider_argument(
+    value: &str,
+    field: &str,
+    maximum: usize,
+) -> Result<(), CliError> {
+    if value.starts_with('-') || value.len() > maximum {
+        return Err(CliError::Config(format!(
+            "`{field}` is too long or starts with an option prefix"
+        )));
+    }
+    Ok(())
+}
+
+fn validate_dns_label_setting(value: &str, field: &str) -> Result<(), CliError> {
+    if value.is_empty()
+        || value.len() > 63
+        || value.starts_with('-')
+        || value.ends_with('-')
+        || !value
+            .bytes()
+            .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-')
+    {
+        return Err(CliError::Config(format!(
+            "`{field}` must be a lowercase DNS label"
+        )));
+    }
+    Ok(())
+}
+
+fn validate_dns_subdomain_setting(value: &str, field: &str) -> Result<(), CliError> {
+    if value.len() > 253
+        || value
+            .split('.')
+            .any(|label| validate_dns_label_setting(label, field).is_err())
+    {
+        return Err(CliError::Config(format!(
+            "`{field}` must be a lowercase DNS subdomain"
+        )));
+    }
+    Ok(())
+}
+
+fn validate_registry_setting(value: &str) -> Result<(), CliError> {
+    if !valid_registry_authority(value) {
+        return Err(CliError::Config(
+            "`settings.target.registry` must be a non-loopback OCI registry host without a URL scheme or path"
+                .into(),
+        ));
+    }
+    Ok(())
+}
+
+fn valid_registry_authority(value: &str) -> bool {
+    if value.is_empty() || value.contains('/') || value.contains("://") {
+        return false;
+    }
+    if value.starts_with('[') {
+        return false;
+    }
+
+    let (host, port_valid) = match value.bytes().filter(|byte| *byte == b':').count() {
+        0 => (value, true),
+        1 => value
+            .rsplit_once(':')
+            .map_or((value, false), |(host, port)| {
+                (host, valid_registry_port(port))
+            }),
+        _ => (value, false),
+    };
+    if !port_valid
+        || host.is_empty()
+        || host.eq_ignore_ascii_case("localhost")
+        || host.eq_ignore_ascii_case("localhost.localdomain")
+    {
+        return false;
+    }
+    if let Ok(address) = host.parse::<std::net::Ipv4Addr>() {
+        return !address.is_loopback() && !address.is_unspecified();
+    }
+    if host
+        .bytes()
+        .all(|byte| byte.is_ascii_digit() || byte == b'.')
+    {
+        return false;
+    }
+    host.len() <= 253
+        && host.split('.').all(|label| {
+            !label.is_empty()
+                && label.len() <= 63
+                && label
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
+                && label
+                    .as_bytes()
+                    .first()
+                    .is_some_and(u8::is_ascii_alphanumeric)
+                && label
+                    .as_bytes()
+                    .last()
+                    .is_some_and(u8::is_ascii_alphanumeric)
+        })
+}
+
+fn valid_registry_port(port: &str) -> bool {
+    !port.is_empty() && port.parse::<u16>().is_ok_and(|port| port > 0)
+}
+
+fn validate_repository_setting(value: &str) -> Result<(), CliError> {
+    if value.starts_with('/')
+        || value.ends_with('/')
+        || value.split('/').any(|part| {
+            part.is_empty()
+                || matches!(part, "." | "..")
+                || !part.bytes().all(|byte| {
+                    byte.is_ascii_lowercase() || byte.is_ascii_digit() || b"._-".contains(&byte)
+                })
+        })
+    {
+        return Err(CliError::Config(
+            "`settings.target.repository` must contain lowercase OCI path segments".into(),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_fly_slug(value: &str, field: &str, maximum: usize) -> Result<(), CliError> {
+    if value.len() > maximum
+        || value.starts_with('-')
+        || value.ends_with('-')
+        || !value
+            .bytes()
+            .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-')
+    {
+        return Err(CliError::Config(format!(
+            "`{field}` must be a lowercase provider slug no longer than {maximum} characters"
+        )));
+    }
+    Ok(())
 }
 
 fn ssh_settings(
@@ -1296,8 +2059,419 @@ mod tests {
     fn bundled_targets_reject_incompatible_isolation_early() {
         assert!(validate_target_isolation(TargetKind::Ssh, Isolation::Project).is_ok());
         assert!(validate_target_isolation(TargetKind::Hetzner, Isolation::Machine).is_ok());
+        assert!(validate_target_isolation(TargetKind::Kubernetes, Isolation::Environment).is_ok());
+        assert!(validate_target_isolation(TargetKind::Fly, Isolation::Environment).is_ok());
         assert!(validate_target_isolation(TargetKind::Ssh, Isolation::Machine).is_err());
         assert!(validate_target_isolation(TargetKind::Hetzner, Isolation::Project).is_err());
+        assert!(validate_target_isolation(TargetKind::Fly, Isolation::Machine).is_err());
+    }
+
+    #[test]
+    fn kubernetes_settings_require_explicit_cluster_and_registry_boundaries() {
+        let supplied = toml::Value::Table(toml::Table::from_iter([
+            (
+                "context".into(),
+                toml::Value::String("rackspace-spot".into()),
+            ),
+            ("registry".into(), toml::Value::String("ghcr.io".into())),
+            (
+                "repository".into(),
+                toml::Value::String("team/lightrail".into()),
+            ),
+            ("ingress_class".into(), toml::Value::String("nginx".into())),
+            (
+                "ingress_service_namespace".into(),
+                toml::Value::String("ingress-nginx".into()),
+            ),
+            (
+                "ingress_service_name".into(),
+                toml::Value::String("ingress-nginx-controller".into()),
+            ),
+        ]));
+
+        let generated = build_settings(
+            TargetKind::Kubernetes,
+            Some("nip.io"),
+            BTreeMap::from([("target".into(), supplied.clone())]),
+            false,
+        )
+        .expect("Kubernetes settings");
+        let target = generated["target"].as_table().expect("target table");
+
+        assert_eq!(
+            target.get("context").and_then(toml::Value::as_str),
+            Some("rackspace-spot")
+        );
+        assert_eq!(
+            target.get("dns_domain").and_then(toml::Value::as_str),
+            Some("nip.io")
+        );
+        assert_eq!(
+            target
+                .get("ingress_service_namespace")
+                .and_then(toml::Value::as_str),
+            Some("ingress-nginx")
+        );
+        assert_eq!(
+            target
+                .get("ingress_service_name")
+                .and_then(toml::Value::as_str),
+            Some("ingress-nginx-controller")
+        );
+        assert_eq!(
+            target
+                .get("control_namespace")
+                .and_then(toml::Value::as_str),
+            Some("lightrail-system")
+        );
+        assert_eq!(
+            target.get("ttl_hours").and_then(toml::Value::as_integer),
+            Some(72)
+        );
+        assert!(
+            generated["dns"]
+                .as_table()
+                .is_some_and(toml::Table::is_empty),
+            "aggregate Kubernetes settings must not contain legacy DNS fields"
+        );
+
+        let target_dns = toml::Value::Table(toml::Table::from_iter([
+            (
+                "context".into(),
+                toml::Value::String("rackspace-spot".into()),
+            ),
+            ("registry".into(), toml::Value::String("ghcr.io".into())),
+            (
+                "repository".into(),
+                toml::Value::String("team/lightrail".into()),
+            ),
+            ("ingress_class".into(), toml::Value::String("nginx".into())),
+            (
+                "ingress_service_namespace".into(),
+                toml::Value::String("ingress-nginx".into()),
+            ),
+            (
+                "ingress_service_name".into(),
+                toml::Value::String("ingress-nginx-controller".into()),
+            ),
+            ("dns_domain".into(), toml::Value::String("nip.io".into())),
+        ]));
+        let generated = build_settings(
+            TargetKind::Kubernetes,
+            None,
+            BTreeMap::from([("target".into(), target_dns)]),
+            false,
+        )
+        .expect("target DNS setting");
+        assert_eq!(
+            generated["target"]
+                .as_table()
+                .and_then(|target| target.get("dns_domain"))
+                .and_then(toml::Value::as_str),
+            Some("nip.io")
+        );
+        assert!(
+            generated["dns"]
+                .as_table()
+                .is_some_and(toml::Table::is_empty)
+        );
+
+        let generated = build_settings(
+            TargetKind::Kubernetes,
+            None,
+            BTreeMap::from([
+                ("target".into(), supplied.clone()),
+                (
+                    "dns".into(),
+                    toml::Value::Table(toml::Table::from_iter([(
+                        "domain".into(),
+                        toml::Value::String("nip.io".into()),
+                    )])),
+                ),
+            ]),
+            false,
+        )
+        .expect("capability DNS setting");
+        assert_eq!(
+            generated["target"]
+                .as_table()
+                .and_then(|target| target.get("dns_domain"))
+                .and_then(toml::Value::as_str),
+            Some("nip.io")
+        );
+        assert!(
+            generated["dns"]
+                .as_table()
+                .is_some_and(toml::Table::is_empty),
+            "legacy Kubernetes DNS answers are normalized into target.dns_domain"
+        );
+
+        assert!(
+            build_settings(
+                TargetKind::Kubernetes,
+                None,
+                BTreeMap::from([
+                    ("target".into(), supplied.clone()),
+                    (
+                        "dns".into(),
+                        toml::Value::Table(toml::Table::from_iter([(
+                            "provider".into(),
+                            toml::Value::String("custom".into()),
+                        )])),
+                    ),
+                ]),
+                false,
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn kubernetes_init_rejects_invalid_provider_values_before_writing_config() {
+        let base = toml::Table::from_iter([
+            (
+                "context".into(),
+                toml::Value::String("rackspace-spot".into()),
+            ),
+            ("registry".into(), toml::Value::String("ghcr.io".into())),
+            (
+                "repository".into(),
+                toml::Value::String("team/lightrail".into()),
+            ),
+            ("ingress_class".into(), toml::Value::String("nginx".into())),
+            (
+                "ingress_service_namespace".into(),
+                toml::Value::String("ingress-nginx".into()),
+            ),
+            (
+                "ingress_service_name".into(),
+                toml::Value::String("ingress-nginx-controller".into()),
+            ),
+        ]);
+        for (key, value) in [
+            ("registry", toml::Value::String("localhost:5000".into())),
+            ("registry", toml::Value::String(":5000".into())),
+            ("registry", toml::Value::String(".".into())),
+            (
+                "registry",
+                toml::Value::String("registry_with_underscore.example".into()),
+            ),
+            (
+                "ingress_service_namespace",
+                toml::Value::String("ingress..nginx".into()),
+            ),
+            ("ingress_service_name", toml::Value::String(String::new())),
+            ("replicas", toml::Value::Integer(0)),
+            ("kubeconfig", toml::Value::Integer(42)),
+            ("unknown", toml::Value::Boolean(true)),
+            (
+                "platforms",
+                toml::Value::Array(vec![
+                    toml::Value::String("linux/amd64".into()),
+                    toml::Value::String("linux/amd64".into()),
+                ]),
+            ),
+        ] {
+            let mut target = base.clone();
+            target.insert(key.into(), value);
+            assert!(
+                build_settings(
+                    TargetKind::Kubernetes,
+                    None,
+                    BTreeMap::from([("target".into(), toml::Value::Table(target))]),
+                    false,
+                )
+                .is_err(),
+                "invalid Kubernetes setting {key} must fail during init"
+            );
+        }
+    }
+
+    #[test]
+    fn kubernetes_init_requires_explicit_ingress_service_identity() {
+        let base = toml::Table::from_iter([
+            (
+                "context".into(),
+                toml::Value::String("rackspace-spot".into()),
+            ),
+            ("registry".into(), toml::Value::String("ghcr.io".into())),
+            (
+                "repository".into(),
+                toml::Value::String("team/lightrail".into()),
+            ),
+            ("ingress_class".into(), toml::Value::String("nginx".into())),
+        ]);
+
+        let error = build_settings(
+            TargetKind::Kubernetes,
+            None,
+            BTreeMap::from([("target".into(), toml::Value::Table(base.clone()))]),
+            false,
+        )
+        .expect_err("missing ingress Service namespace");
+        assert!(
+            error
+                .to_string()
+                .contains("settings.target.ingress_service_namespace")
+        );
+
+        let mut with_namespace = base;
+        with_namespace.insert(
+            "ingress_service_namespace".into(),
+            toml::Value::String("ingress-nginx".into()),
+        );
+        let error = build_settings(
+            TargetKind::Kubernetes,
+            None,
+            BTreeMap::from([("target".into(), toml::Value::Table(with_namespace))]),
+            false,
+        )
+        .expect_err("missing ingress Service name");
+        assert!(
+            error
+                .to_string()
+                .contains("settings.target.ingress_service_name")
+        );
+    }
+
+    #[test]
+    fn kubernetes_registry_and_dns_validators_reject_empty_or_malformed_hosts() {
+        assert!(validate_registry_setting("registry.example:5000").is_ok());
+        assert!(validate_registry_setting("198.51.100.20:5000").is_ok());
+        for registry in [
+            "",
+            ".",
+            ":5000",
+            "registry..example",
+            "-registry.example",
+            "registry-.example",
+            "registry_name.example",
+            "999.999.999.999",
+            "127.0.0.1:5000",
+            "0.0.0.0",
+            "[::1]:5000",
+            "[::]:5000",
+            "[::ffff:127.0.0.1]:5000",
+            "[2001:db8::20]:5000",
+            "2001:db8::20",
+        ] {
+            assert!(
+                validate_registry_setting(registry).is_err(),
+                "{registry:?} must not be accepted as a registry host"
+            );
+        }
+        assert!(validate_dns_label_setting("", "field").is_err());
+        assert!(validate_dns_subdomain_setting(".nginx", "field").is_err());
+        assert!(validate_dns_subdomain_setting("nginx.", "field").is_err());
+        assert!(validate_dns_subdomain_setting("nginx..internal", "field").is_err());
+    }
+
+    #[test]
+    fn fly_settings_use_native_dns_and_a_secret_reference() {
+        let generated = build_settings(
+            TargetKind::Fly,
+            None,
+            BTreeMap::from([(
+                "target".into(),
+                toml::Value::Table(toml::Table::from_iter([(
+                    "token".into(),
+                    toml::Value::String("must-not-be-committed".into()),
+                )])),
+            )]),
+            false,
+        )
+        .expect("Fly settings");
+        let target = generated["target"].as_table().expect("target table");
+
+        assert!(
+            generated["dns"]
+                .as_table()
+                .is_some_and(toml::Table::is_empty)
+        );
+        assert_eq!(
+            target
+                .get("token")
+                .and_then(toml::Value::as_table)
+                .and_then(|token| token.get("secret"))
+                .and_then(toml::Value::as_str),
+            Some("fly-token")
+        );
+        assert!(build_settings(TargetKind::Fly, Some("sslip.io"), BTreeMap::new(), false).is_err());
+        assert!(
+            build_settings(
+                TargetKind::Fly,
+                None,
+                BTreeMap::from([(
+                    "dns".into(),
+                    toml::Value::Table(toml::Table::from_iter([(
+                        "domain".into(),
+                        toml::Value::String("sslip.io".into()),
+                    )])),
+                )]),
+                false,
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn fly_init_rejects_values_the_bundled_plugin_cannot_use() {
+        for (key, value) in [
+            ("registry", toml::Value::String("docker.io".into())),
+            ("memory_mb", toml::Value::Integer(300)),
+            ("lock_ttl_seconds", toml::Value::Integer(300)),
+            ("unknown", toml::Value::Boolean(true)),
+        ] {
+            assert!(
+                build_settings(
+                    TargetKind::Fly,
+                    None,
+                    BTreeMap::from([(
+                        "target".into(),
+                        toml::Value::Table(toml::Table::from_iter([(key.into(), value)])),
+                    )]),
+                    false,
+                )
+                .is_err(),
+                "invalid Fly.io setting {key} must fail during init"
+            );
+        }
+    }
+
+    #[test]
+    fn fly_lock_ttl_exceeds_the_longest_phase_by_more_than_three_minutes() {
+        let target_with_lock_ttl = |lock_ttl_seconds| {
+            toml::Value::Table(toml::Table::from_iter([
+                ("command_timeout_seconds".into(), toml::Value::Integer(300)),
+                (
+                    "readiness_timeout_seconds".into(),
+                    toml::Value::Integer(300),
+                ),
+                (
+                    "lock_ttl_seconds".into(),
+                    toml::Value::Integer(lock_ttl_seconds),
+                ),
+            ]))
+        };
+
+        assert!(
+            build_settings(
+                TargetKind::Fly,
+                None,
+                BTreeMap::from([("target".into(), target_with_lock_ttl(480))]),
+                false,
+            )
+            .is_err()
+        );
+        assert!(
+            build_settings(
+                TargetKind::Fly,
+                None,
+                BTreeMap::from([("target".into(), target_with_lock_ttl(481))]),
+                false,
+            )
+            .is_ok()
+        );
     }
 
     #[test]

@@ -29,7 +29,10 @@ mod types;
 mod version;
 mod wire;
 
-pub use client::{ClientEvent, ClientOptions, PluginClient, SpawnOptions};
+pub use client::{
+    ClientEvent, ClientOptions, DEFAULT_REQUEST_TIMEOUT, MAX_OPERATION_REQUEST_TIMEOUT,
+    PluginClient, SpawnOptions, operation_request_timeout,
+};
 pub use error::{ClientError, ErrorKind, PluginError, PluginResult, ServeError};
 pub use server::{EventSink, PluginHandler, serve, serve_stdio};
 pub use types::*;

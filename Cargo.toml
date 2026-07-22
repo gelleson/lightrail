@@ -5,7 +5,9 @@ members = [
     "crates/lightrail-core",
     "crates/lightrail-plugin-protocol",
     "plugins/lightrail-plugin-compose",
+    "plugins/lightrail-plugin-fly",
     "plugins/lightrail-plugin-hetzner",
+    "plugins/lightrail-plugin-kubernetes",
     "plugins/lightrail-plugin-ssh",
 ]
 

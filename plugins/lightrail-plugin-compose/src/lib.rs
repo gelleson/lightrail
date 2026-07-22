@@ -60,6 +60,7 @@ impl PluginHandler for ComposePlugin {
                 Capability::Exposure,
                 Capability::Dns,
             ],
+            features: Vec::new(),
             required_secrets: vec![SecretRequirement {
                 name: "*".to_owned(),
                 description: Some(
@@ -228,7 +229,7 @@ async fn plan_request(request: PlanRequest) -> Result<PlanResult, ComposePluginE
         let has_changes = !actions.is_empty();
         return Ok(finalize_plan(actions, has_changes, plan_metadata));
     }
-    let (document, inventory, revision) = resolve_compose(&desired, &request.context).await?;
+    let (_document, inventory, revision) = resolve_compose(&desired, &request.context).await?;
     validate_apps(&desired, &inventory)?;
     let target = if capability_needs_target(&metadata.capability) {
         metadata.optional_target(Some(&desired))?
@@ -263,7 +264,6 @@ async fn plan_request(request: PlanRequest) -> Result<PlanResult, ComposePluginE
         "revision": revision,
         "images": images,
         "endpoints": endpoint_values,
-        "document_digest": digest_value(&document),
     });
     Ok(finalize_plan(actions, has_changes, plan_metadata))
 }
@@ -408,18 +408,49 @@ fn action(
     depends_on: Vec<String>,
     rollback_supported: bool,
 ) -> PlannedAction {
+    let rollback = if rollback_supported {
+        Some(RollbackMetadata {
+            supported: true,
+            action: Some("runtime.restore-previous".to_owned()),
+            token: None,
+            metadata: json!({}),
+        })
+    } else {
+        match kind {
+            "builder.buildx" | "builder.transfer" => Some(RollbackMetadata {
+                supported: false,
+                action: None,
+                token: None,
+                metadata: json!({
+                    "reason": "built and transferred images are intentionally retained as reusable build cache"
+                }),
+            }),
+            "runtime.ingress" => Some(RollbackMetadata {
+                supported: false,
+                action: None,
+                token: None,
+                metadata: json!({
+                    "reason": "shared Traefik reconciliation is intentionally retained for other environments"
+                }),
+            }),
+            "runtime.destroy" => Some(RollbackMetadata {
+                supported: false,
+                action: None,
+                token: None,
+                metadata: json!({
+                    "reason": "deleted containers and persistent volume data have no exact automatic inverse"
+                }),
+            }),
+            _ => None,
+        }
+    };
     PlannedAction {
         id: id.to_owned(),
         kind: kind.to_owned(),
         summary: summary.to_owned(),
         destructive,
         depends_on,
-        rollback: rollback_supported.then(|| RollbackMetadata {
-            supported: true,
-            action: Some("runtime.restore-previous".to_owned()),
-            token: None,
-            metadata: json!({}),
-        }),
+        rollback,
         metadata: json!({}),
     }
 }
@@ -455,8 +486,7 @@ async fn apply_request(request: ApplyRequest, events: &EventSink) -> PluginResul
     let (document, inventory, revision) = resolve_compose(&desired, &request.context)
         .await
         .map_err(PluginError::from)?;
-    validate_planned_document(&request.plan.metadata, &document, &revision)
-        .map_err(PluginError::from)?;
+    validate_planned_revision(&request.plan.metadata, &revision).map_err(PluginError::from)?;
     if request.plan.actions.is_empty() {
         return Ok(ApplyResult {
             revision: Some(revision.clone()),
@@ -571,25 +601,13 @@ fn validate_plan_integrity(
     Ok(())
 }
 
-fn validate_planned_document(
+fn validate_planned_revision(
     plan_metadata: &Value,
-    document: &Value,
     revision: &str,
 ) -> Result<(), ComposePluginError> {
-    let expected_digest = plan_metadata
-        .get("document_digest")
-        .and_then(Value::as_str)
-        .ok_or_else(|| {
-            ComposePluginError::InvalidPlan("plan has no Compose document digest".to_owned())
-        })?;
-    if expected_digest != digest_value(document) {
-        return Err(ComposePluginError::InvalidPlan(
-            "resolved Compose document changed after planning".to_owned(),
-        ));
-    }
     if plan_metadata.get("revision").and_then(Value::as_str) != Some(revision) {
         return Err(ComposePluginError::InvalidPlan(
-            "deployment revision changed after planning".to_owned(),
+            "the non-secret deployment revision changed after planning".to_owned(),
         ));
     }
     Ok(())
@@ -658,6 +676,7 @@ async fn apply_capability(
             progress(events, context, "Deploying Compose and Traefik over SSH").await;
             let state = deploy(
                 desired,
+                context,
                 &target,
                 config,
                 &rendered,
@@ -946,6 +965,7 @@ fn validate_context_identity(
     context: &lightrail_plugin_protocol::OperationContext,
     desired: &DesiredState,
 ) -> Result<(), ComposePluginError> {
+    let _ = desired.project_root(context)?;
     if context.environment_id != desired.environment.id {
         return Err(ComposePluginError::InvalidDesired(format!(
             "context environment `{}` does not match desired environment `{}`",
@@ -1114,6 +1134,8 @@ fn config_schema() -> Value {
 
 #[cfg(test)]
 mod tests {
+    use std::{collections::BTreeSet, fs};
+
     use super::*;
 
     #[test]
@@ -1171,6 +1193,115 @@ mod tests {
         assert_eq!(actions.len(), 1);
         assert!(actions[0].destructive);
         assert_eq!(actions[0].kind, "runtime.destroy");
+        let rollback = actions[0]
+            .rollback
+            .as_ref()
+            .expect("destruction declares its irreversible contract");
+        assert!(!rollback.supported);
+        assert!(
+            rollback
+                .metadata
+                .get("reason")
+                .and_then(Value::as_str)
+                .is_some_and(|reason| !reason.is_empty())
+        );
+    }
+
+    #[test]
+    fn runtime_mutations_declare_explicit_rollback_contracts() {
+        let desired = DesiredState::parse(json!({
+            "schema": 1,
+            "project": {
+                "id": "project-id",
+                "slug": "project",
+                "root": "/workspace",
+                "compose": ["compose.yaml"]
+            },
+            "environment": {
+                "id": "lr-environment",
+                "profile": "preview",
+                "branch": "main",
+                "isolation": "project"
+            }
+        }))
+        .expect("up desired");
+        let actions = planned_actions(
+            &Capability::Runtime,
+            &desired,
+            &compose_model::ComposeInventory {
+                services: BTreeMap::new(),
+            },
+            false,
+        );
+
+        assert_eq!(actions.len(), 2);
+        assert!(
+            actions
+                .iter()
+                .all(|action| action.rollback.as_ref().is_some())
+        );
+        assert!(
+            actions
+                .iter()
+                .find(|action| action.kind == "runtime.ingress")
+                .and_then(|action| action.rollback.as_ref())
+                .is_some_and(|rollback| !rollback.supported)
+        );
+        assert!(
+            actions
+                .iter()
+                .find(|action| action.kind == "runtime.compose")
+                .and_then(|action| action.rollback.as_ref())
+                .is_some_and(|rollback| rollback.supported)
+        );
+    }
+
+    #[test]
+    fn retained_builder_mutations_declare_explicit_rollback_contracts() {
+        let desired = DesiredState::parse(json!({
+            "schema": 1,
+            "project": {
+                "id": "project-id",
+                "slug": "project",
+                "root": "/workspace",
+                "compose": ["compose.yaml"]
+            },
+            "environment": {
+                "id": "lr-environment",
+                "profile": "preview",
+                "branch": "main",
+                "isolation": "project"
+            }
+        }))
+        .expect("up desired");
+        let actions = planned_actions(
+            &Capability::Builder,
+            &desired,
+            &compose_model::ComposeInventory {
+                services: BTreeMap::from([(
+                    "web".to_owned(),
+                    compose_model::ServiceInventory {
+                        build: true,
+                        image: None,
+                        ports: BTreeSet::new(),
+                        healthcheck: false,
+                    },
+                )]),
+            },
+            false,
+        );
+
+        assert_eq!(actions.len(), 2);
+        assert!(actions.iter().all(|action| {
+            action.rollback.as_ref().is_some_and(|rollback| {
+                !rollback.supported
+                    && rollback
+                        .metadata
+                        .get("reason")
+                        .and_then(Value::as_str)
+                        .is_some_and(|reason| reason.contains("build cache"))
+            })
+        }));
     }
 
     #[test]
@@ -1317,22 +1448,106 @@ mod tests {
         assert!(validate_plan_integrity(&plan, &metadata).is_err());
     }
 
-    #[test]
-    fn apply_rejects_changed_compose_document_or_revision() {
-        let document = json!({"services": {"web": {"image": "example/web:1"}}});
-        let metadata = json!({
-            "document_digest": digest_value(&document),
-            "revision": "revision-one",
+    #[tokio::test]
+    async fn public_plan_ignores_environment_and_asset_plaintext_but_rejects_structure_drift() {
+        let root = tempfile::tempdir().expect("project root");
+        fs::write(root.path().join("compose.yaml"), "services: {}\n").expect("Compose file");
+        let asset = root.path().join("settings.txt");
+        fs::write(&asset, "first asset value\n").expect("asset");
+        let resolved = root.path().join("resolved.json");
+        let desired = json!({
+            "schema": 1,
+            "project": {
+                "id": "project-id",
+                "slug": "project",
+                "root": root.path(),
+                "compose": ["compose.yaml"]
+            },
+            "environment": {
+                "id": "lr-environment",
+                "profile": "preview",
+                "branch": "main",
+                "isolation": "project"
+            },
+            "resolved_compose_path": resolved,
+            "apps": []
         });
-        assert!(validate_planned_document(&metadata, &document, "revision-one").is_ok());
+        let context = lightrail_plugin_protocol::OperationContext {
+            operation_id: "same-operation".to_owned(),
+            environment_id: "lr-environment".to_owned(),
+            profile: "preview".to_owned(),
+            project_root: Some(root.path().display().to_string()),
+            metadata: json!({
+                "capability": "source",
+                "operation": "up",
+                "target": {},
+                "all": false
+            }),
+            ..lightrail_plugin_protocol::OperationContext::default()
+        };
+        let plan =
+            |context: &lightrail_plugin_protocol::OperationContext, desired: &Value| PlanRequest {
+                context: context.clone(),
+                desired: desired.clone(),
+                current: None,
+            };
+        let resolved_document = |environment: &str, image: &str| {
+            json!({
+                "name": "project",
+                "services": {
+                    "web": {
+                        "image": image,
+                        "environment": {"TOKEN": environment}
+                    }
+                },
+                "configs": {
+                    "settings": {
+                        "name": "project_settings",
+                        "file": asset
+                    }
+                }
+            })
+        };
+
+        fs::write(
+            &resolved,
+            serde_json::to_vec(&resolved_document("first secret", "nginx:1")).expect("serialize"),
+        )
+        .expect("resolved Compose");
+        let first = plan_request(plan(&context, &desired))
+            .await
+            .expect("first plan");
+
+        fs::write(&asset, "second asset value\n").expect("changed asset");
+        fs::write(
+            &resolved,
+            serde_json::to_vec(&resolved_document("second secret", "nginx:1")).expect("serialize"),
+        )
+        .expect("changed resolved Compose");
+        let plaintext_changed = plan_request(plan(&context, &desired))
+            .await
+            .expect("redacted plan");
+
+        assert_eq!(first.metadata, plaintext_changed.metadata);
+        assert_eq!(first.plan_id, plaintext_changed.plan_id);
+        assert!(first.metadata.get("document_digest").is_none());
+
+        fs::write(
+            &resolved,
+            serde_json::to_vec(&resolved_document("second secret", "nginx:2")).expect("serialize"),
+        )
+        .expect("structurally changed Compose");
+        let structure_changed = plan_request(plan(&context, &desired))
+            .await
+            .expect("changed plan");
+        let changed_revision = structure_changed.metadata["revision"]
+            .as_str()
+            .expect("revision");
+
+        assert_ne!(first.plan_id, structure_changed.plan_id);
         assert!(
-            validate_planned_document(
-                &metadata,
-                &json!({"services": {"web": {"image": "example/web:2"}}}),
-                "revision-one",
-            )
-            .is_err()
+            validate_planned_revision(&first.metadata, changed_revision).is_err(),
+            "apply must reject a non-secret structural change after planning"
         );
-        assert!(validate_planned_document(&metadata, &document, "revision-two").is_err());
     }
 }

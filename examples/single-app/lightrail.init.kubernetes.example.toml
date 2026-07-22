@@ -1,0 +1,23 @@
+project_slug = "single-example"
+compose = ["compose.yaml"]
+target = "kubernetes"
+isolation = "environment"
+dns_domain = "sslip.io"
+
+[[apps]]
+name = "hello"
+service = "web"
+port = 8080
+health_path = "/health"
+health_status = 200
+
+[settings.target]
+context = "rackspace-spot"
+registry = "ghcr.io"
+repository = "your-org/lightrail"
+ingress_class = "nginx"
+ingress_service_namespace = "ingress-nginx"
+ingress_service_name = "ingress-nginx-controller"
+control_namespace = "lightrail-system"
+cluster_issuer = "letsencrypt"
+ttl_hours = 72

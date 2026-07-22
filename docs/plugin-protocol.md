@@ -1,7 +1,7 @@
 # Lightrail plugin protocol
 
 Status: protocol 1.0.0 is implemented by
-`lightrail-plugin-protocol`, the core plugin host, and the three bundled
+`lightrail-plugin-protocol`, the core plugin host, and the five bundled
 plugins.
 
 This document describes the language-neutral process boundary. The Rust crate
@@ -26,13 +26,33 @@ atomically. Core uses numeric request IDs; implementations must accept string
 or integer IDs.
 
 Core clears the inherited child environment and passes an explicit allowlist.
-The bundled plugins receive the paths and Docker/SSH integration variables
-they need, but not `LIGHTRAIL_SECRET_*` values. Secrets travel only in typed
-request bodies on stdin.
+Common entries are limited to `PATH`, `HOME`, `USER`, `TMPDIR`,
+`DOCKER_HOST`, and `DOCKER_CONTEXT` when present. SSH/Hetzner/Compose may also
+receive `SSH_AUTH_SOCK`; only the Kubernetes plugin may additionally receive
+`KUBECONFIG`. Plugins never inherit `LIGHTRAIL_SECRET_*` or an ambient Fly API
+token. Secrets travel only in typed request bodies on stdin.
 
 The normal shutdown request is `plugin.shutdown` with `{}` parameters. Core
 then closes stdin and waits up to five seconds before killing an unresponsive
-child. The default operation request timeout is 30 minutes.
+child. Two hours and five minutes is the fallback timeout for initialization
+and other short calls without operation work units. Typed
+validate/plan/apply/inspect/destroy calls instead derive a deadline from exact
+work: one configured command phase plus one readiness phase per unit, with
+each configured phase capped at 60 minutes, one five-minute provider
+coordination margin, saturating arithmetic, and a hard 24-hour request cap.
+Apply counts locked-plan actions plus a final observation unit; core destroy
+calls count locked-plan actions, exact selected environments, and a final
+observation unit. Scalable reads derive units from their requested/observed
+collections. Inspection uses the explicit maximum because a provider may need
+to scan a cluster or account whose cardinality is unknown until it returns.
+
+A plugin must expose independently serial mutation work as plan actions or an
+exact destroy selection. It must not multiply a configured phase timeout by
+undisclosed serial work inside one action; a shared final readiness or
+observation phase is covered by the extra unit. The hard request deadline is
+still cancellation, not permission to abandon a child process or provider
+mutation: timeout sends `$/cancelRequest`, and the normal operation-level
+cancel/rediscovery rules remain authoritative.
 
 ## 2. Trust, discovery, and pins
 
@@ -47,6 +67,8 @@ The bundled IDs are:
 | `dev.lightrail.compose` | `source`, `builder`, `runtime`, `exposure`, `dns` |
 | `dev.lightrail.ssh` | `target`, `operation-lock` |
 | `dev.lightrail.hetzner` | `target`, `operation-lock` |
+| `dev.lightrail.kubernetes` | `builder`, `target`, `runtime`, `exposure`, `dns`, `operation-lock` |
+| `dev.lightrail.fly` | `builder`, `target`, `runtime`, `exposure`, `dns`, `operation-lock` |
 
 Core locates bundled executables beside `lightrail` and checks their manifest
 ID and package version. The resolved path is canonical and absolute; a
@@ -106,6 +128,15 @@ Capabilities are stable strings. Protocol 1.0.0 knows `source`, `builder`,
 `target`, `runtime`, `exposure`, `dns`, `secrets`, `operation-lock`, and
 `usage`; namespaced unknown strings remain representable for extensions.
 Representability does not mean the CLI implements a corresponding command.
+
+`manifest.features` is an additive, default-empty list of namespaced behavior
+contracts. A feature may strengthen the semantics of existing methods without
+adding a new capability or method. Core must gate any behavior that would be
+unsafe against an older plugin on the exact feature string. Unknown feature
+strings remain representable and are ignored unless the caller understands
+them. The bundled Kubernetes and Fly plugins advertise
+`dev.lightrail.selected-destroy.v1`; the other bundled manifests omit the
+empty list on the wire.
 
 ## 4. Methods
 
@@ -200,6 +231,40 @@ core fans out downstream inspection across those target states and preserves
 an endpoint-free degraded environment summary when one machine is
 unreachable.
 
+Feature-capable Environment-isolated plugins use environment contract 1 for
+project-wide inspection:
+
+```json
+{
+  "environment_contract": 1,
+  "environments": [
+    {
+      "environment_id": "lr-58ce76e3c31e120f98bb2140",
+      "project_id": "018f6f9f-21aa-7da8-a1b2-31da91ed5148",
+      "branch": "feature/login",
+      "profile": "preview",
+      "status": "ready",
+      "endpoints": [
+        {
+          "app": "api",
+          "url": "https://feature-login.api.preview.myproject.01020304.sslip.io"
+        }
+      ],
+      "expires_at": "2026-07-22T12:00:00Z",
+      "expires_at_unix": 1784721600
+    }
+  ]
+}
+```
+
+`project_id`, `environment_id`, and `expires_at_unix` are mandatory inputs to
+selected expiry pruning; entries without an expiry remain visible but are not
+prune candidates. IDs must be unique. Core rejects a non-empty list without
+`environment_contract: 1`, cross-project ownership, duplicate IDs, or
+malformed entries instead of inferring a deletion set. Endpoint URLs are
+observations: Fly may return native `fly.dev` URLs and Kubernetes returns the
+route derived from its observed public ingress IPv4.
+
 `plugin.plan` receives context, desired state, and optional current state. Its
 result contains:
 
@@ -210,7 +275,18 @@ result contains:
 - non-secret plugin metadata needed to reject a stale or modified apply.
 
 Planning is side-effect free. Core refuses a destructive action returned by an
-`up` plan; destructive work belongs to `down`.
+`up` plan; destructive work belongs to `down`. For destructive confirmation
+continuity, core canonicalizes and hashes the complete serialized
+`PlanResult`. A change to actions, dependencies, rollback data, or plugin
+metadata is therefore plan drift even if `plan_id` and user-visible summaries
+are unchanged.
+
+`PlannedAction.rollback` is optional on the wire for compatibility, but a
+provider action that may mutate must populate it with either a supported exact
+inverse or `supported: false` plus a safe reason in metadata. Omit it only for
+a genuinely side-effect-free action or an intentionally retained Builder
+artifact. Core reports a potentially executed existing Target or Runtime
+action without that contract as incomplete rollback.
 
 ## 7. Apply, journal, and rollback metadata
 
@@ -223,7 +299,12 @@ plus any existing action journal:
 
 Plugins validate the plan ID against its actions and metadata before mutation.
 The result contains an optional revision, rediscoverable state, and a final
-journal snapshot.
+journal snapshot. Core records that returned state for failure handling:
+whole-capability cleanup of an initially absent capability receives the
+post-apply state when available, while update compensation receives the locked
+pre-apply state. A plugin whose apply call fails before it can return state
+must make partial work rediscoverable from the locked context and exact
+deterministic resource identities.
 
 Each `ActionJournalEntry` has a monotonically increasing sequence number,
 action ID, status, optional safe message, optional rollback metadata, and
@@ -240,6 +321,42 @@ boolean, and a journal. It returns `destroyed`, the final journal, and every
 remaining resource identifier. Already-absent is success. `force` is an
 explicit recovery signal; it does not remove the requirement for core-side
 destructive confirmation or ownership checks.
+
+### 7.1 Selected expiry destruction
+
+`dev.lightrail.selected-destroy.v1` gives `plugin.validate`,
+`plugin.plan`, and `plugin.destroy` an exact-selection contract for
+Environment-isolated expiry pruning. Core first derives candidates from
+environment contract 1, then adds this operation metadata:
+
+```json
+{
+  "operation": "prune",
+  "all": false,
+  "selection": {
+    "schema": 1,
+    "reason": "expired",
+    "environment_ids": [
+      "lr-58ce76e3c31e120f98bb2140"
+    ]
+  }
+}
+```
+
+The desired document also contains `"destroy": true`. The selection must have
+schema 1, the exact reason `expired`, at least one unique environment ID, and
+only IDs proven to belong to the operation project. The plan must contain only
+destructive actions for that exact set.
+
+Core displays that plan, confirms it, takes a project lock, repeats project
+inspection using the same captured expiry cutoff, and requires both the
+candidate set and canonical digest of the complete serialized plan to be
+unchanged. `plugin.destroy` then
+receives the locked context and inspected state. A supporting plugin must
+delete only the selected IDs and return every remaining identifier. It must
+not interpret this request as all environments. Core refuses to invoke the
+path without the advertised feature and never falls back to an unselected
+project-wide destroy.
 
 ## 8. Secrets and wildcard declarations
 
@@ -275,6 +392,22 @@ The Hetzner plugin declares exactly one required name, `hetzner-token`. The SSH
 plugin declares none and relies on OpenSSH configuration, an optional absolute
 identity-file path, or the forwarded SSH agent socket.
 
+The Kubernetes plugin declares the constrained wildcard for application
+secret references used during runtime `up`. Generated Kubernetes Secret
+material is submitted through `kubectl` stdin; it must not be serialized into
+arguments, plans, observations, or diagnostics. Kubeconfig and registry
+credential lookup remain separate explicit environment/tool boundaries, not
+logical secrets copied out of Lightrail's keyring. Values persist in the
+Kubernetes API until namespace deletion, so cluster RBAC, API auditing, and
+etcd encryption remain outside the process protocol.
+
+The Fly plugin declares only required `fly-token`. The token authorizes
+provider API and isolated registry operations and is never inherited as an
+environment variable. Because Fly declares no wildcard, current application
+secret references are rejected at core's declaration boundary before their
+values can be sent to the plugin; a future provider-native app-secret path
+must add an explicit compatible declaration and redacted mutation contract.
+
 Secret values are JSON strings inside `context.secrets`. Rust's `SecretValue`
 redacts `Debug` and `Display`, but all plugin implementations must also avoid
 echoing payloads, errors, or stderr. Values must not appear in plans, journals,
@@ -298,7 +431,10 @@ Event kinds are:
 `plugin.logs` returns historical records and an optional stream ID. When
 `follow` is true, subsequent records arrive as `log` events. The event channel
 is intentionally lossy; authoritative state must always be recoverable through
-inspection.
+inspection. A runtime may return a structured `unsupported` error instead of
+implementing either mode. Among bundled native providers, Kubernetes
+implements historical records only and Fly currently implements neither;
+Compose implements historical and followed logs.
 
 ## 10. Locks and cancellation
 
@@ -336,10 +472,23 @@ project scope acquires the per-machine locks in deterministic provider-ID
 order. It rechecks immutable provider IDs and labels before destructive
 mutation.
 
+Core uses project scope for every mutation on an Environment-isolated profile,
+including current-environment `up`/`down`, `down --all`, and `prune`.
+Kubernetes implements that authority with one
+`coordination.k8s.io/v1` Lease in the configured existing control namespace.
+Acquisition/takeover uses optimistic `resourceVersion` continuity, a live
+owner heartbeats, and same-owner reacquisition returns the exact current
+token.
+
+Fly implements the same project-wide scope with a deterministic lock App and
+stopped sentinel Machine carrying a Fly Machine lease; the lock App is
+retained when environments are destroyed. `lock_ttl_seconds` bounds stale
+lease recovery.
+
 Core may honor `down --force` without a token only for a machine-isolated
 provider whose remote lock authority returns `unavailable`. It never bypasses
 an `acquired: false`/busy lock, and it does not enable this bypass for a shared
-generic SSH target.
+generic SSH or Environment-isolated target.
 
 There are two cancellation mechanisms:
 
@@ -349,9 +498,9 @@ There are two cancellation mechanisms:
   that handler future; the client sends it after a request timeout.
 
 Child processes used by the bundled plugins are kill-on-drop. Followed logs
-stop on Ctrl+C. During `up` and `down`, Ctrl+C sends `plugin.cancel`, waits for
-the active plugin's safe stopping point, and then enters the orchestrator's
-normal rollback or orderly-stop path.
+stop on Ctrl+C. During `up`, `down`, and `prune`, Ctrl+C sends
+`plugin.cancel`, waits for the active plugin's safe stopping point, and then
+enters the orchestrator's normal rollback or orderly-stop path.
 
 ## 11. Errors and compatibility
 
@@ -376,5 +525,6 @@ accepted for forward compatibility. A breaking wire or semantic change
 requires a new protocol major version.
 
 Usage reporting is only a representable capability string. There is no usage
-command or bundled usage plugin. Authenticated tunnels, Fly.io, Kubernetes,
-k3s, PR event sources, and remote state plugins are likewise not implemented.
+command or bundled usage plugin. Authenticated tunnels, cluster provisioning,
+shared Kubernetes setup, k3s lifecycle, custom DNS providers, PR event
+sources, and remote state plugins are likewise not implemented.

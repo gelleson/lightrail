@@ -8,7 +8,10 @@ use std::{
 
 use dialoguer::Password;
 use lightrail_core::{LightrailConfig, SecretName};
-use lightrail_plugin_protocol::{InitializeRequest, PluginClient, PluginManifest, SpawnOptions};
+use lightrail_plugin_protocol::{
+    DiagnosticSeverity, InitializeRequest, InspectResult, PluginClient, PluginManifest,
+    SpawnOptions,
+};
 use secrecy::SecretString;
 use serde::Serialize;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -51,17 +54,28 @@ pub async fn doctor(
     check_target: bool,
     selected_profile: Option<&str>,
 ) -> Result<DoctorReport, CliError> {
-    let mut report = Doctor::new(TokioCommandRunner).local().await;
+    let discovered = LoadedProject::discover(selected_profile);
+    let target_plugin = discovered
+        .as_ref()
+        .ok()
+        .map(|project| project.plugin_id(lightrail_core::Capability::Target));
+    let mut report = Doctor::new(TokioCommandRunner)
+        .local_for(target_plugin)
+        .await;
     if check_target {
-        let target_check = match LoadedProject::discover(selected_profile) {
+        let target_check = match discovered {
             Ok(project) => match crate::orchestrator::inspect_target(project).await {
-                Ok(inspection) => DoctorCheck {
-                    name: "target",
-                    status: target_check_status(inspection.status),
-                    detail: format!("{:?}", inspection.status),
-                    remediation: (target_check_status(inspection.status) == CheckStatus::Failed)
-                        .then_some("Check the selected profile credentials and target settings."),
-                },
+                Ok(inspection) => {
+                    let status = target_inspection_status(&inspection);
+                    DoctorCheck {
+                        name: "target",
+                        status,
+                        detail: target_inspection_detail(&inspection),
+                        remediation: (status == CheckStatus::Failed).then_some(
+                            "Check the selected profile credentials and target settings.",
+                        ),
+                    }
+                }
                 Err(error) => DoctorCheck {
                     name: "target",
                     status: CheckStatus::Failed,
@@ -97,11 +111,6 @@ pub async fn doctor(
         }
         OutputFormat::Human => {
             for check in &report.checks {
-                let detail = if check.name == "target" {
-                    check.detail.to_ascii_lowercase()
-                } else {
-                    check.detail.clone()
-                };
                 output::line(format!(
                     "{:<16} {:<6} {}",
                     check.name,
@@ -110,7 +119,7 @@ pub async fn doctor(
                     } else {
                         "failed"
                     },
-                    detail
+                    check.detail
                 ))?;
                 if let Some(remediation) = check.remediation {
                     output::line(format!("  help: {remediation}"))?;
@@ -133,6 +142,27 @@ const fn target_check_status(status: lightrail_plugin_protocol::ResourceStatus) 
         | lightrail_plugin_protocol::ResourceStatus::Destroying
         | lightrail_plugin_protocol::ResourceStatus::Unknown => CheckStatus::Failed,
     }
+}
+
+fn target_inspection_status(inspection: &InspectResult) -> CheckStatus {
+    if inspection
+        .diagnostics
+        .iter()
+        .any(|item| item.severity == DiagnosticSeverity::Error)
+    {
+        CheckStatus::Failed
+    } else {
+        target_check_status(inspection.status)
+    }
+}
+
+fn target_inspection_detail(inspection: &InspectResult) -> String {
+    let status = format!("{:?}", inspection.status).to_ascii_lowercase();
+    inspection
+        .diagnostics
+        .iter()
+        .find(|item| item.severity == DiagnosticSeverity::Error)
+        .map_or(status.clone(), |item| format!("{status}: {}", item.message))
 }
 
 pub async fn secret(command: SecretCommand, format: OutputFormat) -> Result<(), CliError> {
@@ -574,5 +604,26 @@ mod tests {
             target_check_status(lightrail_plugin_protocol::ResourceStatus::Degraded),
             CheckStatus::Failed
         );
+    }
+
+    #[test]
+    fn target_error_diagnostics_fail_doctor_even_when_status_is_ready() {
+        let inspection = InspectResult {
+            status: lightrail_plugin_protocol::ResourceStatus::Ready,
+            endpoints: Vec::new(),
+            state: serde_json::json!({}),
+            diagnostics: vec![lightrail_plugin_protocol::Diagnostic {
+                severity: DiagnosticSeverity::Error,
+                code: "missing_ingress".to_owned(),
+                message: "IngressClass `Public-NGINX` is unavailable".to_owned(),
+                path: None,
+                help: None,
+            }],
+        };
+
+        assert_eq!(target_inspection_status(&inspection), CheckStatus::Failed);
+        let detail = target_inspection_detail(&inspection);
+        assert!(detail.starts_with("ready:"));
+        assert!(detail.contains("Public-NGINX"));
     }
 }

@@ -1,16 +1,19 @@
 use std::{
     collections::{BTreeMap, BTreeSet},
     ffi::OsString,
-    path::PathBuf,
+    path::{Path, PathBuf},
 };
 
 use lightrail_core::{DnsLabel, Hostname, IpDnsDomain};
-use lightrail_plugin_protocol::Endpoint;
+use lightrail_plugin_protocol::{Endpoint, OperationContext};
 use serde_json::{Map, Value, json};
 use sha2::{Digest, Sha256};
 
 use crate::{
-    contract::{DesiredState, PluginConfig, TargetState},
+    contract::{
+        DesiredState, EnvironmentInput, PluginConfig, TargetState, canonical_project_source,
+        project_relative_source,
+    },
     error::ComposePluginError,
 };
 
@@ -50,18 +53,9 @@ pub fn compose_config_arguments(paths: &[PathBuf]) -> Vec<OsString> {
 }
 
 pub fn inspect_document(document: &Value) -> Result<ComposeInventory, ComposePluginError> {
-    if let Some(volumes) = document.get("volumes").and_then(Value::as_object) {
-        for (name, definition) in volumes {
-            if definition
-                .get("external")
-                .is_some_and(|external| external == true)
-            {
-                return Err(ComposePluginError::ExternalVolume {
-                    volume: name.clone(),
-                });
-            }
-        }
-    }
+    validate_top_level_networks(document)?;
+    validate_top_level_volumes(document)?;
+    validate_top_level_assets(document)?;
     let services = document
         .get("services")
         .and_then(Value::as_object)
@@ -77,11 +71,20 @@ pub fn inspect_document(document: &Value) -> Result<ComposeInventory, ComposePlu
                 "Compose service `{name}` must be an object"
             ))
         })?;
-        if service.get("network_mode").and_then(Value::as_str) == Some("host") {
-            return Err(ComposePluginError::HostNetwork {
-                service: name.clone(),
-            });
+        if service
+            .get("network_mode")
+            .is_some_and(|value| !is_empty(value))
+        {
+            if service.get("network_mode").and_then(Value::as_str) == Some("host") {
+                return Err(ComposePluginError::HostNetwork {
+                    service: name.clone(),
+                });
+            }
+            return Err(ComposePluginError::InvalidDesired(format!(
+                "service `{name}` uses network_mode, which cannot be preserved by the isolated Compose runtime"
+            )));
         }
+        validate_service_networks(name, service)?;
         if let Some(volumes) = service.get("volumes").and_then(Value::as_array) {
             for volume in volumes {
                 if let Some(source) = bind_mount_source(volume) {
@@ -126,6 +129,246 @@ pub fn inspect_document(document: &Value) -> Result<ComposeInventory, ComposePlu
     })
 }
 
+fn validate_top_level_networks(document: &Value) -> Result<(), ComposePluginError> {
+    let Some(networks) = document.get("networks").filter(|value| !value.is_null()) else {
+        return Ok(());
+    };
+    let networks = networks.as_object().ok_or_else(|| {
+        ComposePluginError::InvalidDesired(
+            "top-level Compose `networks` must be an object".to_owned(),
+        )
+    })?;
+    if networks.is_empty() {
+        return Ok(());
+    }
+    if networks.len() != 1 || !networks.contains_key("default") {
+        return Err(ComposePluginError::InvalidDesired(
+            "only Compose's implicit `default` network is supported; custom or multiple networks cannot be isolated safely"
+                .to_owned(),
+        ));
+    }
+    let definition = &networks["default"];
+    if definition.is_null() {
+        return Ok(());
+    }
+    let definition = definition.as_object().ok_or_else(|| {
+        ComposePluginError::InvalidDesired(
+            "top-level Compose network `default` must be an object".to_owned(),
+        )
+    })?;
+    let unsupported = definition
+        .iter()
+        .filter(|(field, value)| {
+            !matches!(field.as_str(), "name" | "ipam" | "external") && !is_empty(value)
+        })
+        .map(|(field, _)| field.as_str())
+        .collect::<Vec<_>>();
+    if !unsupported.is_empty()
+        || definition.get("ipam").is_some_and(|value| !is_empty(value))
+        || definition.get("external").is_some_and(external_enabled)
+    {
+        return Err(ComposePluginError::InvalidDesired(format!(
+            "top-level Compose network `default` uses unsupported custom options{}",
+            if unsupported.is_empty() {
+                String::new()
+            } else {
+                format!(": {}", unsupported.join(", "))
+            }
+        )));
+    }
+    if let Some(name) = definition.get("name") {
+        let name = name.as_str().ok_or_else(|| {
+            ComposePluginError::InvalidDesired(
+                "top-level Compose network `default.name` must be a string".to_owned(),
+            )
+        })?;
+        let project_name = compose_project_name(document, "network")?;
+        let expected = format!("{project_name}_default");
+        if name != expected {
+            return Err(ComposePluginError::InvalidDesired(format!(
+                "top-level Compose network `default` has custom name `{name}`; only generated `{expected}` is supported"
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn validate_service_networks(
+    service_name: &str,
+    service: &Map<String, Value>,
+) -> Result<(), ComposePluginError> {
+    let Some(networks) = service.get("networks").filter(|value| !value.is_null()) else {
+        return Ok(());
+    };
+    let networks = networks.as_object().ok_or_else(|| {
+        ComposePluginError::InvalidDesired(format!(
+            "Compose service `{service_name}` networks must be an object"
+        ))
+    })?;
+    if networks.is_empty() {
+        return Ok(());
+    }
+    if networks.len() != 1 || !networks.contains_key("default") {
+        return Err(ComposePluginError::InvalidDesired(format!(
+            "service `{service_name}` must use only Compose's implicit `default` network"
+        )));
+    }
+    if !is_empty(&networks["default"]) {
+        return Err(ComposePluginError::InvalidDesired(format!(
+            "service `{service_name}` uses aliases, static addresses, or other unsupported `default` network options"
+        )));
+    }
+    Ok(())
+}
+
+fn validate_top_level_volumes(document: &Value) -> Result<(), ComposePluginError> {
+    let Some(volumes) = document.get("volumes").filter(|value| !value.is_null()) else {
+        return Ok(());
+    };
+    let volumes = volumes.as_object().ok_or_else(|| {
+        ComposePluginError::InvalidDesired(
+            "top-level Compose `volumes` must be an object".to_owned(),
+        )
+    })?;
+    for (name, raw) in volumes {
+        if raw.is_null() {
+            continue;
+        }
+        let definition = raw.as_object().ok_or_else(|| {
+            ComposePluginError::InvalidDesired(format!(
+                "top-level Compose volume `{name}` must be an object"
+            ))
+        })?;
+        if definition.get("external").is_some_and(external_enabled) {
+            return Err(ComposePluginError::ExternalVolume {
+                volume: name.clone(),
+            });
+        }
+        let unsupported = definition
+            .iter()
+            .filter(|(field, value)| {
+                !matches!(field.as_str(), "name" | "external") && !is_empty(value)
+            })
+            .map(|(field, _)| field.as_str())
+            .collect::<Vec<_>>();
+        if !unsupported.is_empty() {
+            return Err(ComposePluginError::InvalidDesired(format!(
+                "top-level Compose volume `{name}` uses unsupported custom options: {}",
+                unsupported.join(", ")
+            )));
+        }
+        validate_generated_resource_name(document, "volume", name, definition)?;
+    }
+    Ok(())
+}
+
+fn validate_top_level_assets(document: &Value) -> Result<(), ComposePluginError> {
+    for kind in ["configs", "secrets"] {
+        let Some(resources) = document.get(kind).filter(|value| !value.is_null()) else {
+            continue;
+        };
+        let resources = resources.as_object().ok_or_else(|| {
+            ComposePluginError::InvalidDesired(format!(
+                "top-level Compose `{kind}` must be an object"
+            ))
+        })?;
+        for (name, raw) in resources {
+            let definition = raw.as_object().ok_or_else(|| {
+                ComposePluginError::InvalidDesired(format!(
+                    "top-level Compose {kind} entry `{name}` must be an object"
+                ))
+            })?;
+            if definition.get("external").is_some_and(external_enabled) {
+                return Err(ComposePluginError::InvalidDesired(format!(
+                    "external Compose {kind} entry `{name}` is not owned by the environment"
+                )));
+            }
+            let unsupported = definition
+                .iter()
+                .filter(|(field, value)| {
+                    !matches!(field.as_str(), "file" | "name" | "external") && !is_empty(value)
+                })
+                .map(|(field, _)| field.as_str())
+                .collect::<Vec<_>>();
+            if !unsupported.is_empty() {
+                return Err(ComposePluginError::InvalidDesired(format!(
+                    "top-level Compose {kind} entry `{name}` uses unsupported options: {}",
+                    unsupported.join(", ")
+                )));
+            }
+            let file = definition
+                .get("file")
+                .and_then(Value::as_str)
+                .filter(|file| !file.is_empty())
+                .ok_or_else(|| {
+                    ComposePluginError::InvalidDesired(format!(
+                        "top-level Compose {kind} entry `{name}` must be backed by a file"
+                    ))
+                })?;
+            if file.contains('\0') {
+                return Err(ComposePluginError::InvalidDesired(format!(
+                    "top-level Compose {kind} entry `{name}` has an invalid file path"
+                )));
+            }
+            validate_generated_resource_name(document, kind, name, definition)?;
+        }
+    }
+    Ok(())
+}
+
+fn validate_generated_resource_name(
+    document: &Value,
+    kind: &str,
+    logical_name: &str,
+    definition: &Map<String, Value>,
+) -> Result<(), ComposePluginError> {
+    let Some(name) = definition.get("name") else {
+        return Ok(());
+    };
+    let name = name.as_str().ok_or_else(|| {
+        ComposePluginError::InvalidDesired(format!(
+            "top-level Compose {kind} `{logical_name}.name` must be a string"
+        ))
+    })?;
+    let project_name = compose_project_name(document, kind)?;
+    let expected = format!("{project_name}_{logical_name}");
+    if name != expected {
+        return Err(ComposePluginError::InvalidDesired(format!(
+            "top-level Compose {kind} `{logical_name}` has custom name `{name}`; only generated `{expected}` is supported"
+        )));
+    }
+    Ok(())
+}
+
+fn compose_project_name<'a>(
+    document: &'a Value,
+    resource: &str,
+) -> Result<&'a str, ComposePluginError> {
+    document
+        .get("name")
+        .and_then(Value::as_str)
+        .filter(|name| !name.is_empty())
+        .ok_or_else(|| {
+            ComposePluginError::InvalidDesired(format!(
+                "resolved Compose must include its project name to verify generated {resource} names"
+            ))
+        })
+}
+
+fn external_enabled(value: &Value) -> bool {
+    !matches!(value, Value::Null | Value::Bool(false))
+}
+
+fn is_empty(value: &Value) -> bool {
+    match value {
+        Value::Null | Value::Bool(false) => true,
+        Value::String(value) => value.is_empty(),
+        Value::Array(value) => value.is_empty(),
+        Value::Object(value) => value.is_empty(),
+        Value::Bool(true) | Value::Number(_) => false,
+    }
+}
+
 pub fn validate_apps(
     desired: &DesiredState,
     inventory: &ComposeInventory,
@@ -146,14 +389,319 @@ pub fn validate_apps(
     Ok(warnings)
 }
 
-pub fn deployment_revision(desired: &DesiredState, document: &Value) -> String {
+/// Derive a source-contained, checkout-portable deployment revision.
+///
+/// # Errors
+///
+/// Returns an error when the resolved Compose model is unsupported or any
+/// local source resolves outside the operation's granted Git root.
+pub fn deployment_revision(
+    desired: &DesiredState,
+    document: &Value,
+    context: &OperationContext,
+) -> Result<String, ComposePluginError> {
+    inspect_document(document)?;
+    let root = desired.project_root(context)?;
+    let compose_paths = desired.compose_paths(context)?;
+    let (stable_document, facts) = canonical_revision_document(document, &root)?;
+    let stable_desired = canonical_revision_desired(desired, &root, &compose_paths)?;
     let mut hasher = Sha256::new();
-    hasher.update(b"lightrail/compose/revision/v1\0");
-    let mut stable_desired = desired.clone();
-    stable_desired.resolved_compose_path = None;
-    hasher.update(serde_json::to_vec(&stable_desired).unwrap_or_default());
-    hasher.update(serde_json::to_vec(document).unwrap_or_default());
-    format!("{:x}", hasher.finalize())
+    hasher.update(b"lightrail/compose/revision/v2\0");
+    hasher.update(serde_json::to_vec(&stable_desired)?);
+    hasher.update(serde_json::to_vec(&stable_document)?);
+    if desired.environment.dirty
+        || facts.local_build
+        || facts.resolved_environment
+        || facts.file_asset
+        || desired.apps.iter().any(|app| !app.environment.is_empty())
+    {
+        // Git cannot prove that ignored files are excluded from Docker build
+        // contexts. Environment and file-backed asset values are deliberately
+        // absent from provider-visible revision input. An operation salt makes
+        // every such `up` reconcile without exposing those bytes in metadata;
+        // Buildx still reuses its content-addressed cache.
+        hasher.update(context.operation_id.as_bytes());
+    }
+    Ok(format!("{:x}", hasher.finalize()))
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+struct RevisionFacts {
+    local_build: bool,
+    resolved_environment: bool,
+    file_asset: bool,
+}
+
+fn canonical_revision_desired(
+    desired: &DesiredState,
+    root: &Path,
+    compose_paths: &[PathBuf],
+) -> Result<DesiredState, ComposePluginError> {
+    let mut stable = desired.clone();
+    stable.project.root = None;
+    stable.resolved_compose_path = None;
+    stable.project.compose = compose_paths
+        .iter()
+        .map(|path| {
+            project_relative_source(root, path, &format!("Compose file `{}`", path.display()))
+                .map(PathBuf::from)
+        })
+        .collect::<Result<_, _>>()?;
+    for app in &mut stable.apps {
+        for input in app.environment.values_mut() {
+            if let EnvironmentInput::Literal(value) = input {
+                "<literal>".clone_into(value);
+            }
+        }
+    }
+    Ok(stable)
+}
+
+fn canonical_revision_document(
+    document: &Value,
+    root: &Path,
+) -> Result<(Value, RevisionFacts), ComposePluginError> {
+    let mut stable = document.clone();
+    let object = stable.as_object_mut().ok_or_else(|| {
+        ComposePluginError::InvalidDesired("resolved Compose document must be an object".to_owned())
+    })?;
+    object.remove("name");
+    object.insert("networks".to_owned(), json!({"default": null}));
+    if let Some(volumes) = object.get_mut("volumes").and_then(Value::as_object_mut) {
+        for definition in volumes.values_mut() {
+            *definition = Value::Null;
+        }
+    }
+
+    let mut facts = RevisionFacts::default();
+    for kind in ["configs", "secrets"] {
+        let Some(resources) = object.get_mut(kind).and_then(Value::as_object_mut) else {
+            continue;
+        };
+        for (name, definition) in resources {
+            let definition = definition.as_object_mut().ok_or_else(|| {
+                ComposePluginError::InvalidDesired(format!(
+                    "top-level Compose {kind} entry `{name}` must be an object"
+                ))
+            })?;
+            definition.remove("name");
+            definition.remove("external");
+            let file = definition
+                .get("file")
+                .and_then(Value::as_str)
+                .ok_or_else(|| {
+                    ComposePluginError::InvalidDesired(format!(
+                        "top-level Compose {kind} entry `{name}` must be backed by a file"
+                    ))
+                })?;
+            let source = canonical_project_source(
+                root,
+                root,
+                Path::new(file),
+                &format!("Compose {kind} file `{name}`"),
+            )?;
+            if !source.is_file() {
+                return Err(ComposePluginError::InvalidDesired(format!(
+                    "Compose {kind} file `{name}` must be a regular file"
+                )));
+            }
+            definition.insert(
+                "file".to_owned(),
+                Value::String(project_relative_source(
+                    root,
+                    &source,
+                    &format!("Compose {kind} file `{name}`"),
+                )?),
+            );
+            facts.file_asset = true;
+        }
+    }
+
+    let services = object
+        .get_mut("services")
+        .and_then(Value::as_object_mut)
+        .ok_or_else(|| {
+            ComposePluginError::InvalidDesired(
+                "resolved Compose document must contain a services object".to_owned(),
+            )
+        })?;
+    for (service_name, raw) in services {
+        let service = raw.as_object_mut().ok_or_else(|| {
+            ComposePluginError::InvalidDesired(format!(
+                "Compose service `{service_name}` must be an object"
+            ))
+        })?;
+        service.insert("networks".to_owned(), json!({"default": null}));
+        if let Some(environment) = service.get_mut("environment") {
+            facts.resolved_environment |= !is_empty(environment);
+            let environment = environment.as_object_mut().ok_or_else(|| {
+                ComposePluginError::InvalidDesired(format!(
+                    "Compose service `{service_name}` environment must be an object"
+                ))
+            })?;
+            for value in environment.values_mut() {
+                *value = Value::Null;
+            }
+        }
+        let Some(build) = service.get("build").filter(|value| !value.is_null()) else {
+            continue;
+        };
+        service.insert(
+            "build".to_owned(),
+            canonical_build_revision_value(root, service_name, build)?,
+        );
+        facts.local_build = true;
+    }
+    Ok((stable, facts))
+}
+
+fn canonical_build_revision_value(
+    root: &Path,
+    service_name: &str,
+    raw: &Value,
+) -> Result<Value, ComposePluginError> {
+    if let Some(path) = raw.as_str() {
+        let context = canonical_build_context(root, service_name, path)?;
+        validate_default_dockerfile(root, service_name, &context, None)?;
+        return Ok(Value::String(project_relative_source(
+            root,
+            &context,
+            &format!("build context for service `{service_name}`"),
+        )?));
+    }
+    let mut build = raw.as_object().cloned().ok_or_else(|| {
+        ComposePluginError::InvalidDesired(format!(
+            "resolved Compose build for service `{service_name}` must be a string or object"
+        ))
+    })?;
+    let context_value = build
+        .get("context")
+        .and_then(Value::as_str)
+        .ok_or_else(|| {
+            ComposePluginError::InvalidDesired(format!(
+                "resolved Compose build for service `{service_name}` must contain a context path"
+            ))
+        })?;
+    let context = canonical_build_context(root, service_name, context_value)?;
+    build.insert(
+        "context".to_owned(),
+        Value::String(project_relative_source(
+            root,
+            &context,
+            &format!("build context for service `{service_name}`"),
+        )?),
+    );
+    if let Some(dockerfile) = build.get("dockerfile").cloned() {
+        let dockerfile = dockerfile.as_str().ok_or_else(|| {
+            ComposePluginError::InvalidDesired(format!(
+                "resolved Compose Dockerfile for service `{service_name}` must be a path string"
+            ))
+        })?;
+        let source = canonical_project_source(
+            root,
+            &context,
+            Path::new(dockerfile),
+            &format!("Dockerfile for service `{service_name}`"),
+        )?;
+        if !source.is_file() {
+            return Err(ComposePluginError::InvalidDesired(format!(
+                "Dockerfile for service `{service_name}` must be a regular file"
+            )));
+        }
+        build.insert(
+            "dockerfile".to_owned(),
+            Value::String(project_relative_source(
+                root,
+                &source,
+                &format!("Dockerfile for service `{service_name}`"),
+            )?),
+        );
+    } else if !build.contains_key("dockerfile_inline") {
+        validate_default_dockerfile(root, service_name, &context, None)?;
+    }
+    canonicalize_additional_build_contexts(root, service_name, &mut build)?;
+    Ok(Value::Object(build))
+}
+
+fn canonicalize_additional_build_contexts(
+    root: &Path,
+    service_name: &str,
+    build: &mut Map<String, Value>,
+) -> Result<(), ComposePluginError> {
+    let Some(contexts) = build
+        .get_mut("additional_contexts")
+        .filter(|value| !is_empty(value))
+    else {
+        return Ok(());
+    };
+    let contexts = contexts.as_object_mut().ok_or_else(|| {
+        ComposePluginError::InvalidDesired(format!(
+            "additional build contexts for service `{service_name}` must be an object"
+        ))
+    })?;
+    for (name, value) in contexts {
+        let path = value.as_str().ok_or_else(|| {
+            ComposePluginError::InvalidDesired(format!(
+                "additional build context `{name}` for service `{service_name}` must be a local path"
+            ))
+        })?;
+        let source = canonical_project_source(
+            root,
+            root,
+            Path::new(path),
+            &format!("additional build context `{name}` for service `{service_name}`"),
+        )?;
+        if !source.is_dir() {
+            return Err(ComposePluginError::InvalidDesired(format!(
+                "additional build context `{name}` for service `{service_name}` must be a directory"
+            )));
+        }
+        *value = Value::String(project_relative_source(
+            root,
+            &source,
+            &format!("additional build context `{name}` for service `{service_name}`"),
+        )?);
+    }
+    Ok(())
+}
+
+fn canonical_build_context(
+    root: &Path,
+    service_name: &str,
+    value: &str,
+) -> Result<PathBuf, ComposePluginError> {
+    let context = canonical_project_source(
+        root,
+        root,
+        Path::new(value),
+        &format!("build context for service `{service_name}`"),
+    )?;
+    if !context.is_dir() {
+        return Err(ComposePluginError::InvalidDesired(format!(
+            "build context for service `{service_name}` must be a directory"
+        )));
+    }
+    Ok(context)
+}
+
+fn validate_default_dockerfile(
+    root: &Path,
+    service_name: &str,
+    context: &Path,
+    dockerfile: Option<&Path>,
+) -> Result<(), ComposePluginError> {
+    let source = canonical_project_source(
+        root,
+        context,
+        dockerfile.unwrap_or_else(|| Path::new("Dockerfile")),
+        &format!("Dockerfile for service `{service_name}`"),
+    )?;
+    if !source.is_file() {
+        return Err(ComposePluginError::InvalidDesired(format!(
+            "Dockerfile for service `{service_name}` must be a regular file"
+        )));
+    }
+    Ok(())
 }
 
 pub fn image_map(
@@ -229,6 +777,7 @@ pub fn render_deployment(
         Value::String(desired.environment.id.clone()),
     );
     scope_named_volumes(base_object, desired)?;
+    scope_file_assets(base_object)?;
     let images = image_map(desired, inventory, revision)?;
     let mut sensitive_services = Map::new();
 
@@ -456,6 +1005,26 @@ fn scope_named_volumes(
     Ok(())
 }
 
+fn scope_file_assets(document: &mut Map<String, Value>) -> Result<(), ComposePluginError> {
+    for kind in ["configs", "secrets"] {
+        let Some(resources) = document.get_mut(kind).and_then(Value::as_object_mut) else {
+            continue;
+        };
+        for (name, definition) in resources {
+            let definition = definition.as_object_mut().ok_or_else(|| {
+                ComposePluginError::InvalidDesired(format!(
+                    "top-level Compose {kind} entry `{name}` must be an object"
+                ))
+            })?;
+            // `docker compose config` materializes a checkout-derived name.
+            // Removing it lets the remote environment project scope the
+            // uploaded file-backed resource.
+            definition.remove("name");
+        }
+    }
+    Ok(())
+}
+
 pub fn ingress_compose(config: &PluginConfig) -> Value {
     let mut command = vec![
         "--api.dashboard=false".to_owned(),
@@ -616,7 +1185,9 @@ fn bind_mount_source(value: &Value) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
-    use std::{net::Ipv4Addr, str::FromStr};
+    use std::{fs, net::Ipv4Addr, path::Path, str::FromStr};
+
+    use tempfile::TempDir;
 
     use super::*;
     use crate::contract::{AppSpec, EnvironmentSpec, Isolation, ProjectSpec};
@@ -669,6 +1240,63 @@ mod tests {
         }
     }
 
+    fn source_fixture() -> (TempDir, DesiredState, OperationContext) {
+        let root = tempfile::tempdir().expect("temporary project");
+        fs::write(root.path().join("compose.yaml"), "services: {}\n").expect("Compose file");
+        fs::create_dir(root.path().join("web")).expect("build context");
+        fs::write(root.path().join("web/Dockerfile"), "FROM scratch\n").expect("Dockerfile");
+        fs::create_dir(root.path().join("shared")).expect("additional build context");
+        fs::write(root.path().join("shared/value.txt"), "fixture\n")
+            .expect("additional context file");
+        fs::write(root.path().join("settings.txt"), "fixture\n").expect("config");
+        let mut desired = desired();
+        desired.project.root = Some(root.path().to_path_buf());
+        let context = operation_context(root.path(), "operation-one");
+        (root, desired, context)
+    }
+
+    fn operation_context(root: &Path, operation_id: &str) -> OperationContext {
+        OperationContext {
+            operation_id: operation_id.to_owned(),
+            environment_id: "lr-abc".to_owned(),
+            profile: "preview".to_owned(),
+            project_root: Some(root.display().to_string()),
+            ..OperationContext::default()
+        }
+    }
+
+    fn portable_document(root: &Path, project_name: &str, environment: &str) -> Value {
+        json!({
+            "name": project_name,
+            "services": {
+                "web": {
+                    "build": {
+                        "context": root.join("web"),
+                        "dockerfile": root.join("web/Dockerfile"),
+                        "additional_contexts": {
+                            "shared": root.join("shared")
+                        }
+                    },
+                    "environment": {"TOKEN": environment},
+                    "networks": {"default": null},
+                    "ports": [{"target": 3000}]
+                }
+            },
+            "networks": {
+                "default": {"name": format!("{project_name}_default")}
+            },
+            "volumes": {
+                "data": {"name": format!("{project_name}_data")}
+            },
+            "configs": {
+                "settings": {
+                    "name": format!("{project_name}_settings"),
+                    "file": root.join("settings.txt")
+                }
+            }
+        })
+    }
+
     #[test]
     fn validates_and_discovers_compose_services() {
         let document = json!({
@@ -707,6 +1335,40 @@ mod tests {
             inspect_document(&bind),
             Err(ComposePluginError::BindMount { .. })
         ));
+    }
+
+    #[test]
+    fn rejects_custom_network_and_volume_semantics() {
+        for document in [
+            json!({
+                "services": {"web": {"image": "nginx", "networks": {"private": null}}},
+                "networks": {"private": {}}
+            }),
+            json!({
+                "name": "demo",
+                "services": {
+                    "web": {
+                        "image": "nginx",
+                        "networks": {"default": {"aliases": ["web.internal"]}}
+                    }
+                },
+                "networks": {"default": {"name": "demo_default"}}
+            }),
+            json!({
+                "name": "demo",
+                "services": {"web": {"image": "nginx"}},
+                "volumes": {"data": {"name": "shared-data"}}
+            }),
+            json!({
+                "services": {"web": {"image": "nginx"}},
+                "volumes": {"data": {"driver": "local"}}
+            }),
+        ] {
+            assert!(
+                inspect_document(&document).is_err(),
+                "custom network and volume semantics must fail closed: {document}"
+            );
+        }
     }
 
     #[test]
@@ -803,16 +1465,216 @@ mod tests {
     }
 
     #[test]
-    fn ephemeral_resolved_path_does_not_change_revision() {
-        let document = json!({"services": {"web": {"image": "nginx"}}});
-        let mut first = desired();
+    fn revision_is_checkout_portable_and_ignores_ephemeral_paths() {
+        let (first_root, mut first, first_context) = source_fixture();
+        let (second_root, mut second, second_context) = source_fixture();
         first.resolved_compose_path = Some(PathBuf::from("/tmp/first.json"));
-        let mut second = first.clone();
         second.resolved_compose_path = Some(PathBuf::from("/tmp/second.json"));
+        let first_document = portable_document(first_root.path(), "checkout-one", "first-secret");
+        let second_document =
+            portable_document(second_root.path(), "checkout-two", "second-secret");
 
         assert_eq!(
-            deployment_revision(&first, &document),
-            deployment_revision(&second, &document)
+            deployment_revision(&first, &first_document, &first_context).expect("first revision"),
+            deployment_revision(&second, &second_document, &second_context)
+                .expect("second revision")
         );
+    }
+
+    #[test]
+    fn local_builds_are_operation_scoped_but_stable_within_one_operation() {
+        let (root, desired, context) = source_fixture();
+        let document = json!({
+            "services": {
+                "web": {
+                    "build": {
+                        "context": root.path().join("web"),
+                        "dockerfile": root.path().join("web/Dockerfile")
+                    }
+                }
+            }
+        });
+        let first = deployment_revision(&desired, &document, &context).expect("plan revision");
+        let repeated = deployment_revision(&desired, &document, &context).expect("apply revision");
+        let next = deployment_revision(
+            &desired,
+            &document,
+            &operation_context(root.path(), "operation-two"),
+        )
+        .expect("next operation revision");
+
+        assert_eq!(
+            first, repeated,
+            "plan and apply must agree within one operation"
+        );
+        assert_ne!(
+            first, next,
+            "every local-build up gets an operation revision"
+        );
+    }
+
+    #[test]
+    fn ordinary_image_only_revision_is_reusable_across_operations() {
+        let (root, desired, context) = source_fixture();
+        let document = json!({"services": {"web": {"image": "nginx:stable"}}});
+        let first = deployment_revision(&desired, &document, &context).expect("first revision");
+        let next = deployment_revision(
+            &desired,
+            &document,
+            &operation_context(root.path(), "operation-two"),
+        )
+        .expect("next revision");
+
+        assert_eq!(first, next);
+    }
+
+    #[test]
+    fn environment_values_never_influence_revision_metadata() {
+        let (root, mut desired, context) = source_fixture();
+        let first_document =
+            json!({"services": {"web": {"image": "nginx", "environment": {"TOKEN": "first"}}}});
+        let second_document =
+            json!({"services": {"web": {"image": "nginx", "environment": {"TOKEN": "second"}}}});
+        desired.apps[0].environment.insert(
+            "APP_TOKEN".to_owned(),
+            EnvironmentInput::Literal("first-app-value".to_owned()),
+        );
+        let first =
+            deployment_revision(&desired, &first_document, &context).expect("first revision");
+        desired.apps[0].environment.insert(
+            "APP_TOKEN".to_owned(),
+            EnvironmentInput::Literal("second-app-value".to_owned()),
+        );
+        let changed_plaintext =
+            deployment_revision(&desired, &second_document, &context).expect("redacted revision");
+        let next_operation = deployment_revision(
+            &desired,
+            &second_document,
+            &operation_context(root.path(), "operation-two"),
+        )
+        .expect("next operation revision");
+
+        assert_eq!(
+            first, changed_plaintext,
+            "resolved and desired environment plaintext must be absent from the digest"
+        );
+        assert_ne!(
+            changed_plaintext, next_operation,
+            "environment-bearing deployments must reconcile on each up"
+        );
+    }
+
+    #[test]
+    fn file_backed_assets_are_contained_and_operation_scoped() {
+        let (root, desired, context) = source_fixture();
+        let document = json!({
+            "name": "demo",
+            "services": {"web": {"image": "nginx"}},
+            "configs": {
+                "settings": {
+                    "name": "demo_settings",
+                    "file": root.path().join("settings.txt")
+                }
+            }
+        });
+        let first = deployment_revision(&desired, &document, &context).expect("first revision");
+        let next = deployment_revision(
+            &desired,
+            &document,
+            &operation_context(root.path(), "operation-two"),
+        )
+        .expect("next revision");
+
+        assert_ne!(first, next);
+    }
+
+    #[test]
+    fn rejects_sources_and_roots_outside_the_granted_checkout() {
+        let (root, mut desired, context) = source_fixture();
+        let outside = tempfile::tempdir().expect("outside source");
+        fs::write(outside.path().join("Dockerfile"), "FROM scratch\n").expect("Dockerfile");
+        let outside_build = json!({
+            "services": {
+                "web": {
+                    "build": {
+                        "context": outside.path(),
+                        "dockerfile": outside.path().join("Dockerfile")
+                    }
+                }
+            }
+        });
+        assert!(deployment_revision(&desired, &outside_build, &context).is_err());
+
+        let outside_additional_context = json!({
+            "services": {
+                "web": {
+                    "build": {
+                        "context": root.path().join("web"),
+                        "dockerfile": root.path().join("web/Dockerfile"),
+                        "additional_contexts": {
+                            "escaped": outside.path()
+                        }
+                    }
+                }
+            }
+        });
+        assert!(deployment_revision(&desired, &outside_additional_context, &context).is_err());
+
+        desired.project.root = Some(outside.path().to_path_buf());
+        let ordinary = json!({"services": {"web": {"image": "nginx"}}});
+        assert!(deployment_revision(&desired, &ordinary, &context).is_err());
+
+        // Keep both temporary directories live for the complete assertion.
+        assert!(root.path().is_dir());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn rejects_symbolic_link_source_escapes() {
+        use std::os::unix::fs::symlink;
+
+        let (root, mut desired, context) = source_fixture();
+        let outside = tempfile::tempdir().expect("outside source");
+        fs::write(outside.path().join("Dockerfile"), "FROM scratch\n").expect("Dockerfile");
+        fs::write(outside.path().join("secret.txt"), "outside\n").expect("asset");
+
+        symlink(outside.path(), root.path().join("escaped-build")).expect("build symlink");
+        let escaped_build = json!({
+            "services": {
+                "web": {
+                    "build": {
+                        "context": root.path().join("escaped-build"),
+                        "dockerfile": root.path().join("escaped-build/Dockerfile")
+                    }
+                }
+            }
+        });
+        assert!(deployment_revision(&desired, &escaped_build, &context).is_err());
+
+        symlink(
+            outside.path().join("secret.txt"),
+            root.path().join("escaped-secret.txt"),
+        )
+        .expect("asset symlink");
+        let escaped_asset = json!({
+            "name": "demo",
+            "services": {"web": {"image": "nginx"}},
+            "secrets": {
+                "token": {
+                    "name": "demo_token",
+                    "file": root.path().join("escaped-secret.txt")
+                }
+            }
+        });
+        assert!(deployment_revision(&desired, &escaped_asset, &context).is_err());
+
+        symlink(
+            outside.path().join("secret.txt"),
+            root.path().join("linked-compose.yaml"),
+        )
+        .expect("Compose symlink");
+        desired.project.compose = vec![PathBuf::from("linked-compose.yaml")];
+        let ordinary = json!({"services": {"web": {"image": "nginx"}}});
+        assert!(deployment_revision(&desired, &ordinary, &context).is_err());
     }
 }

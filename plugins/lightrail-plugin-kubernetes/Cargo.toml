@@ -1,0 +1,28 @@
+[package]
+name = "lightrail-plugin-kubernetes"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Existing-cluster Kubernetes builder, target, runtime, and ingress capabilities for Lightrail"
+
+[dependencies]
+anyhow.workspace = true
+async-trait.workspace = true
+futures.workspace = true
+hex.workspace = true
+lightrail-core = { path = "../../crates/lightrail-core" }
+lightrail-plugin-protocol = { path = "../../crates/lightrail-plugin-protocol" }
+reqwest.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+tokio.workspace = true
+uuid.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+
+[lints]
+workspace = true

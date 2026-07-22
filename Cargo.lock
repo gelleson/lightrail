@@ -856,6 +856,24 @@ dependencies = [
 ]
 
 [[package]]
+name = "lightrail-plugin-fly"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "futures",
+ "hex",
+ "lightrail-plugin-protocol",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "sha2",
+ "tempfile",
+ "tokio",
+ "uuid",
+]
+
+[[package]]
 name = "lightrail-plugin-hetzner"
 version = "0.1.0"
 dependencies = [
@@ -871,6 +889,25 @@ dependencies = [
  "tempfile",
  "tokio",
  "tracing",
+ "uuid",
+]
+
+[[package]]
+name = "lightrail-plugin-kubernetes"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "futures",
+ "hex",
+ "lightrail-core",
+ "lightrail-plugin-protocol",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "sha2",
+ "tempfile",
+ "tokio",
  "uuid",
 ]
 
