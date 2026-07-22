@@ -62,8 +62,12 @@ release:
 
 release-fast: build-fast
 
+HOST_TARGET := $(shell rustc -vV 2>/dev/null | sed -n 's/host: //p')
+TARGET ?= $(HOST_TARGET)
+TARGET_ENV_VAR := CARGO_TARGET_$(shell echo $(TARGET) | tr '[:lower:]-' '[:upper:]_' | tr '.' '_')_RUSTFLAGS
+
 static:
-	RUSTFLAGS="$(RUSTFLAGS) -C target-feature=+crt-static" $(CARGO) build $(VERBOSE_FLAG) $(CARGO_FLAGS) --release --workspace --locked
+	$(TARGET_ENV_VAR)="$(RUSTFLAGS) -C target-feature=+crt-static" $(CARGO) build $(VERBOSE_FLAG) $(CARGO_FLAGS) --release --workspace --locked --target $(TARGET)
 
 release-static: static
 
